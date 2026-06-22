@@ -1,6 +1,15 @@
 services:
   odysseus:
-    build: .
+    build:
+      context: .
+      args:
+        # Default true on Crafthost so PyMuPDF (PDF form-filling), faster-whisper
+        # (local STT), ddgs (DuckDuckGo search), and markitdown (Office/EPUB
+        # extraction) ship in the image. The Dockerfile installs requirements.txt
+        # unconditionally and only adds requirements-optional.txt when this is
+        # "true". Override to "false" for a pure-MIT-core image.
+        # NOTE: PyMuPDF is AGPL-3.0 — see requirements-optional.txt + ACKNOWLEDGMENTS.md.
+        INSTALL_OPTIONAL: ${INSTALL_OPTIONAL:-true}
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
     volumes:
