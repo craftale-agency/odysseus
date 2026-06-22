@@ -921,8 +921,20 @@ def _anthropic_rejects_temperature(model: str) -> bool:
         return False
     return (int(match.group(1)), int(match.group(2))) >= (4, 7)
 
-# Models that support structured thinking — may output </think> without opening tag
-_THINKING_MODEL_PATTERNS = ("qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax", "m2-reap", "gemma")
+# Models that support structured thinking — may output </think> without opening tag.
+# Keep the list broad: a false positive (treating a non-thinking model as thinking)
+# only costs us a `think: false` flag that the model ignores, while a false negative
+# leaves a thinking model burning its output budget on <think> blocks during agent
+# tool-call rounds, surfacing as "The model returned an empty response."
+_THINKING_MODEL_PATTERNS = (
+    "qwen3", "qwq",
+    "deepseek-r1", "deepseek-reasoner",
+    "minimax", "m2-reap",
+    "gemma",            # gemma3/gemma4 thinking variants
+    "thinker",          # thinker14b, gemma4-thinker, etc. — Ollama's reasoning-tuned tags
+    "reason",           # misc *-reason / *-reasoner tags
+    "r1",               # *-r1-* family
+)
 
 def _supports_thinking(model: str) -> bool:
     """Check if model supports structured thinking output."""
