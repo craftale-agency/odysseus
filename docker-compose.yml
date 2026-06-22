@@ -28,7 +28,7 @@ services:
       - RESEARCH_LLM_ENDPOINT=${RESEARCH_LLM_ENDPOINT:-}
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
-      - SEARXNG_INSTANCE=http://searxng:8080
+      - SEARXNG_INSTANCE=${SEARXNG_INSTANCE:-http://searxng:8080}
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
@@ -71,8 +71,6 @@ services:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
     depends_on:
-      searxng:
-        condition: service_healthy
       chromadb:
         condition: service_started
     restart: unless-stopped
@@ -88,6 +86,10 @@ services:
     restart: unless-stopped
 
   searxng:
+    # Opt-in via `docker compose --profile full-stack up`. Skipped by default
+    # so deployments that already provide a searxng on the docker network
+    # (e.g. a shared `searxng` service) don't fight for port 8080.
+    profiles: [full-stack]
     # Pinned, not :latest — odysseus waits on searxng's healthcheck
     # (depends_on: condition: service_healthy), so a broken upstream `latest`
     # tag blocks the whole app from starting. 2026.6.2 crashes on boot with
@@ -138,6 +140,9 @@ services:
     restart: unless-stopped
 
   ntfy:
+    # Opt-in via `docker compose --profile full-stack up`. Same rationale
+    # as searxng above — not every deployment needs a private ntfy broker.
+    profiles: [full-stack]
     image: docker.io/binwiederhier/ntfy
     command: serve
     ports:
