@@ -13,18 +13,27 @@ services:
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
     volumes:
-      - ${APP_DATA_DIR:-./data}:/app/data:z
-      - ${APP_LOGS_DIR:-./logs}:/app/logs:z
+      # Named volumes — Docker manages them under /var/lib/docker/volumes/
+      # and they survive container recreates + Dokploy redeploys. Compose
+      # auto-namespaces them with the project name, so co-deployed instances
+      # (Odysseus + Odypezzus on the same host) each get their own volumes
+      # automatically. The previous bind-mount design defaulted to ./data,
+      # which inside Dokploy resolved to /etc/dokploy/compose/<appName>/code/data
+      # — a directory Dokploy wipes on every redeploy, losing chats and user
+      # data. To mount a host directory instead (for backups or host-side
+      # inspection), override via a custom compose override file.
+      - odysseus-data:/app/data
+      - odysseus-logs:/app/logs
       # Cookbook remote-server SSH identity. Odysseus can generate a key here;
       # add the shown public key to each remote server's authorized_keys.
-      - ${APP_DATA_DIR:-./data}/ssh:/app/.ssh:z
+      - odysseus-ssh:/app/.ssh
       # Cookbook local model cache. Inside Docker, "Local" means the Odysseus
-      # container, so persist its HuggingFace cache under ./data/huggingface.
-      - ${APP_DATA_DIR:-./data}/huggingface:/app/.cache/huggingface:z
+      # container, so persist its HuggingFace cache in its own named volume.
+      - odysseus-hf-cache:/app/.cache/huggingface
       # Cookbook-installed Python CLIs/packages (vLLM, llama-cpp-python, etc.)
       # land under /app/.local for the odysseus user. Persist them so a
       # container recreate does not silently remove installed serve engines.
-      - ${APP_DATA_DIR:-./data}/local:/app/.local:z
+      - odysseus-local:/app/.local
     extra_hosts:
       # Lets the container reach local services on the Docker host, including
       # Ollama at http://host.docker.internal:11434.
@@ -184,6 +193,11 @@ services:
     restart: unless-stopped
 
 volumes:
+  odysseus-data:
+  odysseus-logs:
+  odysseus-ssh:
+  odysseus-hf-cache:
+  odysseus-local:
   searxng-data:
   chromadb-data:
   ntfy-cache:
