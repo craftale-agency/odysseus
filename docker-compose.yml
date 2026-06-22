@@ -78,7 +78,7 @@ services:
   chromadb:
     image: docker.io/chromadb/chroma:latest
     ports:
-      - "${CHROMADB_BIND:-127.0.0.1}:8100:8000"
+      - "${CHROMADB_BIND:-127.0.0.1}:${CHROMADB_HOST_PORT:-8100}:8000"
     volumes:
       - chromadb-data:/chroma/chroma
     environment:
