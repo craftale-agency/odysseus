@@ -31,6 +31,12 @@ services:
       - SEARXNG_INSTANCE=${SEARXNG_INSTANCE:-http://searxng:8080}
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
+      # Comma-separated list of proxy hostnames that front an Ollama
+      # OpenAI-compat /v1 endpoint (e.g. langfuse-openai-proxy via Cloudflare
+      # Tunnel). When set, Odysseus forwards `think: false` to thinking models
+      # (qwen3/gemma4) through those proxies so tool-call requests aren't
+      # swallowed by <think> blocks.
+      - ODYSSEUS_PROXY_OLLAMA_HOSTS=${ODYSSEUS_PROXY_OLLAMA_HOSTS:-openai.craftshost.com}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
       - AUTH_ENABLED=${AUTH_ENABLED:-true}
       - LOCALHOST_BYPASS=${LOCALHOST_BYPASS:-false}
