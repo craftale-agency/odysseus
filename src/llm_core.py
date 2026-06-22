@@ -1455,6 +1455,9 @@ _THINKING_MODEL_PATTERNS = (
     "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
     "minimax", "m2-reap", "gemma", "stepfun", "step-3", "step3",
     "magistral", "mistral-small", "mistral-medium",
+    "thinker",          # thinker14b, gemma4-thinker — Ollama reasoning-tuned tags
+    "reason",           # misc *-reason / *-reasoner tags
+    "r1",               # *-r1-* family
 )
 
 def _supports_thinking(model: str) -> bool:
