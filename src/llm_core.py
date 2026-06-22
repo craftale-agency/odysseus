@@ -19,7 +19,7 @@ class LLMConfig:
     """Configuration constants for LLM operations."""
     DEFAULT_TIMEOUT = 30
     DEFAULT_TEMPERATURE = 1.0
-    DEFAULT_MAX_TOKENS = 4096
+    DEFAULT_MAX_TOKENS = 16384
     MAX_RETRIES = 3
     RETRY_DELAY = 0.5
     STREAM_TIMEOUT = 300
@@ -301,21 +301,36 @@ def _is_ollama_native_url(url: str) -> bool:
 
 
 def _is_ollama_openai_compat_url(url: str) -> bool:
-    """Return True for local Ollama's OpenAI-compatible /v1 surface.
+    """Return True for endpoints that talk to Ollama's OpenAI-compat /v1 surface.
 
     Mirrors the host detection used by ``_is_ollama_native_url`` so that the
     two helpers stay in lockstep: a localhost Ollama on a non-default port
     (custom ``OLLAMA_HOST``, reverse proxy, container port remap) is treated
     the same way here as it is on the native ``/api`` path.
+
+    Also matches a configured proxy in front of Ollama (e.g. langfuse-openai-proxy
+    reached via Cloudflare Tunnel). Such proxies forward ``extra_body`` verbatim
+    to Ollama, so the ``think: false`` flag we send still lands. Configure the
+    proxy hostnames via ``ODYSSEUS_PROXY_OLLAMA_HOSTS`` (comma-separated,
+    matched against the URL hostname exactly OR as a trailing ``.<host>``).
     """
     try:
         parsed = urlparse(url or "")
     except Exception:
         return False
-    host = parsed.hostname or ""
+    host = (parsed.hostname or "").lower()
     path = (parsed.path or "").rstrip("/")
     local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
-    return local_ollama_host and (path == "/v1" or path.startswith("/v1/"))
+    if local_ollama_host and (path == "/v1" or path.startswith("/v1/")):
+        return True
+    proxy_hosts = tuple(
+        h.lower().strip()
+        for h in os.getenv("ODYSSEUS_PROXY_OLLAMA_HOSTS", "").split(",")
+        if h.strip()
+    )
+    if proxy_hosts and any(host == h or host.endswith(f".{h}") for h in proxy_hosts):
+        return True
+    return False
 
 
 def _ollama_api_root(url: str) -> str:
