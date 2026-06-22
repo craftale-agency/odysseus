@@ -1039,6 +1039,46 @@ def _is_self_hosted_openai_compatible(url: str) -> bool:
     return is_local_endpoint(url)
 
 
+def _apply_ollama_num_ctx(payload: Dict, url: str, model: str) -> None:
+    """Add ``options.num_ctx`` to an outgoing Ollama OpenAI-compat payload.
+
+    Ollama's default context window is 4096 tokens regardless of the loaded
+    model's advertised limit. When a request brings more input than that
+    (agent pathway with tools + attachments, large pasted docs, long chat
+    history), Ollama silently truncates the prompt to its 4095-token limit
+    and the model emits an empty response — there's no usable signal left.
+
+    The native ``/api/chat`` path handles this via ``_build_ollama_payload``,
+    which sets ``options.num_ctx`` from ``get_context_length(url, model)``.
+    The OpenAI-compat ``/v1/chat/completions`` path bypasses that builder, so
+    without this helper Ollama stays at its 4096 default forever — the empty-
+    response bug returns for any large request even with think:false applied.
+
+    Ollama's ``/v1`` endpoint accepts the same ``options`` object shape as
+    ``/api/chat``: a top-level ``options.num_ctx`` integer. We mirror the
+    native path's trust check — only set num_ctx when ``get_context_length``
+    returns a real model-specific value (not the DEFAULT_CONTEXT fallback),
+    so we don't guess for unknown models.
+    """
+    if not _is_ollama_openai_compat_url(url):
+        return
+    try:
+        ctx = get_context_length(url, model)
+    except Exception:
+        return
+    # Skip only on a true "unknown" sentinel (None / 0). Deliberately NOT
+    # checking against DEFAULT_CONTEXT: that constant (128000) is also the
+    # real context length of several common models (gemma3/gemma4), so the
+    # equality check would incorrectly skip them and leave Ollama at 4096.
+    # Sending num_ctx when get_context_length returned a real number — even
+    # its fallback — is strictly better than letting Ollama default to 4096
+    # and silently truncate the prompt.
+    if not ctx or ctx <= 0:
+        return
+    payload.setdefault("options", {})
+    payload["options"].setdefault("num_ctx", ctx)
+
+
 def _apply_local_cache_affinity(payload: Dict, url: str, session_id: Optional[str]) -> None:
     """Add llama.cpp-server slot-affinity hints to an outgoing payload, in place.
 
@@ -2415,6 +2455,10 @@ async def llm_call_async(
             payload["think"] = False
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
+        # Pass the model's real context window through to Ollama — otherwise
+        # Ollama defaults num_ctx to 4096 and truncates any larger request,
+        # surfacing as "The model returned an empty response."
+        _apply_ollama_num_ctx(payload, url, model)
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
 
@@ -2674,6 +2718,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # Pass the model's real context window through — Ollama defaults to
+        # 4096 and silently truncates anything larger, which surfaces as an
+        # empty response once the agent pathway + attachments exceed that.
+        _apply_ollama_num_ctx(payload, url, model)
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         _scrub_openai_chat_tool_reasoning(payload, target_url, model)
