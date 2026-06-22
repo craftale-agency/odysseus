@@ -106,7 +106,7 @@ PASSWORD_MIN_LENGTH = 8
 
 # Default parameters
 DEFAULT_TEMPERATURE = 1.0
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 16384
 
 
 def internal_api_base() -> str:
