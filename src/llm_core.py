@@ -738,6 +738,13 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
         from src.copilot import copilot_headers
         for k, v in copilot_headers(None).items():
             h.setdefault(k, v)
+    # Tell the Langfuse-Openai-Proxy to keep reasoning in its own SSE field
+    # (delta.reasoning) instead of folding it into delta.content. Odysseus is
+    # reasoning-aware — the stream parser reads delta.reasoning into the
+    # thinking panel — so a separate field yields a clean answer stream plus a
+    # populated thinking panel. Harmless on providers that don't recognize the
+    # header (unknown X- headers are ignored); setdefault keeps any override.
+    h.setdefault("X-Reasoning-As-Content", "false")
     return h
 
 
