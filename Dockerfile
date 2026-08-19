@@ -92,6 +92,15 @@ COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
 RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
 
+# basicsr.data.degradations imports torchvision.transforms.functional_tensor,
+# which torchvision removed in 0.17+. In-app paths shim it at runtime
+# (src/optional_deps.py, wired via routes/shell_routes.py and
+# routes/gallery/gallery_routes.py); patch the installed module too so
+# Cookbook/agent scripts importing realesrgan in a bare interpreter work
+# without knowing about the shim.
+RUN sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
+        /usr/local/lib/python3.14/site-packages/basicsr/data/degradations.py
+
 # Copy app code
 COPY . .
 
