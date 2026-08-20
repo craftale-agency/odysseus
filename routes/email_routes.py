@@ -6218,6 +6218,11 @@ def setup_email_routes():
         The token arrives directly from the token endpoint over TLS (not via
         the browser), so decoding the claims without signature verification
         carries the same trust level as the access token beside it.
+
+        UPN (preferred_username) is preferred over the `email` claim: with a
+        multi-tenant app, `email` is an unverified claim a foreign tenant can
+        set to a victim address (the "nOAuth" attack) — prefer the UPN, which
+        always identifies the signing user inside the issuing tenant.
         """
         import base64
         import json as _json
@@ -6226,9 +6231,9 @@ def setup_email_routes():
             payload += "=" * (-len(payload) % 4)
             claims = _json.loads(base64.urlsafe_b64decode(payload))
             return str(
-                claims.get("email")
-                or claims.get("preferred_username")
+                claims.get("preferred_username")
                 or claims.get("upn")
+                or claims.get("email")
                 or ""
             ).strip()
         except Exception:
