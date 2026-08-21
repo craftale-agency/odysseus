@@ -210,10 +210,16 @@ def _read_accounts_from_db() -> list:
         columns = {r[1] for r in conn.execute("PRAGMA table_info(email_accounts)").fetchall()}
         owner_select = "owner" if "owner" in columns else "NULL AS owner"
         smtp_security_select = "smtp_security" if "smtp_security" in columns else "'' AS smtp_security"
+        oauth_select = (
+            "oauth_provider, oauth_access_token, oauth_token_expiry"
+            if "oauth_provider" in columns
+            else "'' AS oauth_provider, '' AS oauth_access_token, '' AS oauth_token_expiry"
+        )
         rows = conn.execute(f"""
             SELECT id, {owner_select}, name, is_default, enabled,
                    imap_host, imap_port, imap_user, imap_password, imap_starttls,
-                   smtp_host, smtp_port, {smtp_security_select}, smtp_user, smtp_password, from_address
+                   smtp_host, smtp_port, {smtp_security_select}, smtp_user, smtp_password, from_address,
+                   {oauth_select}
             FROM email_accounts WHERE enabled = 1
             ORDER BY is_default DESC, created_at ASC
         """).fetchall()
@@ -347,6 +353,12 @@ def _load_config(account: str | None = None) -> dict:
         cfg["smtp_user"] = row["smtp_user"] or cfg["smtp_user"]
         cfg["smtp_password"] = _decrypt(row["smtp_password"]) if row["smtp_password"] else cfg["smtp_password"]
         cfg["from_address"] = row["from_address"] or row["imap_user"] or cfg["from_address"]
+        # OAuth (google/microsoft) accounts: keep the ENCRYPTED token fields
+        # as-is — the shared email_helpers getters decrypt/refresh them via
+        # src.secret_storage and persist rotation back to the DB row.
+        cfg["oauth_provider"] = (row["oauth_provider"] or "") if "oauth_provider" in row.keys() else ""
+        cfg["oauth_access_token"] = (row["oauth_access_token"] or "") if "oauth_access_token" in row.keys() else ""
+        cfg["oauth_token_expiry"] = str(row["oauth_token_expiry"] or "") if "oauth_token_expiry" in row.keys() else ""
     else:
         # Legacy fallback: settings.json flat keys
         try:
@@ -371,6 +383,23 @@ def _load_config(account: str | None = None) -> dict:
 
 
 # ── IMAP helpers ──
+
+
+def _oauth_token(cfg):
+    """Valid OAuth access token for google/microsoft accounts, or None.
+
+    Reuses the shared email_helpers getters so refresh + rotation + DB
+    persistence behave identically to the in-app email path.
+    """
+    provider = str(cfg.get("oauth_provider") or "").strip().lower()
+    if provider not in ("google", "microsoft"):
+        return None
+    from routes.email_helpers import (
+        _get_valid_google_token,
+        _get_valid_microsoft_token,
+    )
+    getter = _get_valid_google_token if provider == "google" else _get_valid_microsoft_token
+    return getter(cfg.get("account_id"), cfg)
 
 
 def _imap_connect(account: str | None = None):
@@ -402,7 +431,12 @@ def _imap_connect(account: str | None = None):
     if getattr(conn, "sock", None):
         conn.sock.settimeout(EMAIL_SOCKET_TIMEOUT)
     try:
-        conn.login(cfg["imap_user"], cfg["imap_password"])
+        token = _oauth_token(cfg)
+        if token:
+            from routes.email_helpers import _xoauth2_bytes
+            conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
+        else:
+            conn.login(cfg["imap_user"], cfg["imap_password"])
     except Exception:
         # A failed login otherwise orphans the connected socket; close it
         # before propagating (shutdown() is the pre-auth low-level close). (#3174)
@@ -1310,7 +1344,13 @@ def _read_email_across_accounts(uid=None, message_id=None, folder="INBOX"):
 
 
 def _smtp_ready(cfg: dict) -> bool:
-    return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
+    # OAuth accounts (google/microsoft) carry no SMTP password — the token
+    # pair authorizes sending. Mirrors email_helpers' readiness check.
+    return bool(
+        cfg.get("smtp_host")
+        and cfg.get("smtp_user")
+        and (cfg.get("smtp_password") or cfg.get("oauth_provider"))
+    )
 
 
 def _resolve_send_config(account=None):
@@ -1364,7 +1404,25 @@ def _smtp_connect(account=None, cfg=None):
             port,
             timeout=EMAIL_SOCKET_TIMEOUT,
         )
-    if cfg["smtp_user"] and cfg["smtp_password"]:
+    oauth_token = _oauth_token(cfg)
+    if oauth_token:
+        try:
+            from routes.email_helpers import _xoauth2_raw
+            conn.ehlo()
+            conn.auth(
+                "XOAUTH2",
+                lambda challenge=None: _xoauth2_raw(cfg["smtp_user"], oauth_token),
+                initial_response_ok=True,
+            )
+        except Exception:
+            # A failed auth otherwise orphans the connected socket; close it
+            # before propagating (SMTP has no shutdown(); close() = socket close). (#3174)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+    elif cfg["smtp_user"] and cfg["smtp_password"]:
         try:
             conn.login(cfg["smtp_user"], cfg["smtp_password"])
         except Exception:
