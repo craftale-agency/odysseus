@@ -70,9 +70,11 @@ def test_policy_returns_signup_enabled(tmp_path):
 
 
 def test_policy_returns_session_days(tmp_path):
+    from core.auth import TOKEN_TTL
+
     mgr = _make_manager(tmp_path)
     policy = mgr.policy()
-    assert policy["session_days"] == 7
+    assert policy["session_days"] == TOKEN_TTL // 86400
 
 
 # ── GET /api/auth/policy endpoint ──────────────────────────────────────

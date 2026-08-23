@@ -50,7 +50,11 @@ ADMIN_PRIVILEGES["block_all_models"] = False
 from src.constants import AUTH_FILE, PASSWORD_MIN_LENGTH
 from src.owner_identity import RESERVED_AUTH_USERNAMES
 DEFAULT_AUTH_PATH = AUTH_FILE
-TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
+# Session/token lifetime. Env-overridable because a short cookie expiring
+# mid-conversation kicks the browser to /login and orphans the in-flight
+# agent turn's rendering (the reply IS persisted server-side, but the UI
+# never shows it). Default 30 days; tune via ODYSSEUS_TOKEN_TTL (seconds).
+TOKEN_TTL = int(os.environ.get("ODYSSEUS_TOKEN_TTL", 60 * 60 * 24 * 30))
 
 # Usernames the auth + middleware layer reserves for request sentinels and
 # internal storage owners; they must never belong to a real login account.
