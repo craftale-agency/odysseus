@@ -82,6 +82,7 @@ services:
       chromadb:
         condition: service_started
     restart: unless-stopped
+    mem_limit: 1g
     deploy:
       resources:
         reservations:
@@ -92,6 +93,7 @@ services:
             - gpu
   chromadb:
     image: docker.io/chromadb/chroma:latest
+    mem_limit: 256m
     ports:
     - ${CHROMADB_BIND:-127.0.0.1}:${CHROMADB_HOST_PORT:-8100}:8000
     volumes:
