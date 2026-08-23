@@ -42,12 +42,12 @@ def test_many_distinct_same_tool_is_not_runaway():
 
 
 def test_identical_call_repeated_is_runaway():
-    sigs = ['manage_calendar:{"action":"list_events"}'] * 15
+    sigs = ['manage_calendar:{"action":"list_events"}'] * 3
     assert _detect_runaway_call(_freq(sigs)) == 'manage_calendar'
 
 
 def test_below_threshold_is_not_runaway():
-    sigs = ['bash:ls'] * 14
+    sigs = ['bash:ls'] * 2
     assert _detect_runaway_call(_freq(sigs)) is None
 
 

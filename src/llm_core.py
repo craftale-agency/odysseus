@@ -779,6 +779,10 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = _alias_harmony_tools(tools, model)
+    # Ollama native /api/chat rejects the JSON *string* "false" (400).
+    # Always send a real bool for thinking models.
+    if _supports_thinking(model):
+        payload["think"] = False
     return payload
 
 

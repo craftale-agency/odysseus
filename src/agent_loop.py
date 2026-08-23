@@ -3402,11 +3402,16 @@ def build_active_plan_note(approved_plan: str) -> str:
     )
 
 
-def _detect_runaway_call(call_freq, threshold=15):
+def _detect_runaway_call(call_freq, threshold=3):
     """Tool name of a call signature repeated >= ``threshold`` times — a real
     runaway loop. Counts IDENTICAL repeated calls (same tool AND args), so a
     legitimate batch of distinct calls to one tool (e.g. creating 18 calendar
     events at once) is NOT flagged. Returns ``None`` when nothing is runaway.
+
+    Threshold is 3: qwen3.5:9b on the shared lane repeated the same
+    ``manage_memory`` search 6× in 40s (2026-08-23) while writing a little
+    text each turn, which reset the stuck-round detector. 15 was too high
+    to catch that. Distinct-arg batches still pass.
 
     ``call_freq`` is a Counter keyed by ``"{tool_type}:{content[:120]}"``.
     """

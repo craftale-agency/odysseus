@@ -163,3 +163,13 @@ class TestThinkSuppression:
             monkeypatch, "http://127.0.0.1:11435/v1/chat/completions", "qwen3:14b"
         )
         assert payload.get("think") is False
+
+    def test_native_payload_think_is_bool_not_string(self):
+        """Ollama /api/chat 400s on think=\"false\" (string). Native builder
+        must emit a real bool for thinking models (2026-08-23)."""
+        payload = llm_core._build_ollama_payload(
+            "qwen3.5:9b", [{"role": "user", "content": "hi"}],
+            temperature=0.0, max_tokens=0,
+        )
+        assert payload.get("think") is False
+        assert not isinstance(payload.get("think"), str)

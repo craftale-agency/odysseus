@@ -7,6 +7,7 @@ Provides token estimation for context usage tracking.
 
 import ipaddress
 import logging
+import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -87,18 +88,40 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
         return None
 
 
+def _is_configured_ollama_proxy_host(host: str) -> bool:
+    """True when ``host`` is an ODYSSEUS_PROXY_OLLAMA_HOSTS entry.
+
+    Those hostnames front this machine's Ollama (one GPU pipe). They must
+    take the local model gate even when the endpoint_kind is ``proxy``,
+    otherwise overlapping agent rounds 429 behind OLLAMA_QUEUE_TIMEOUT.
+    """
+    if not host:
+        return False
+    host = host.lower()
+    proxy_hosts = tuple(
+        h.lower().strip()
+        for h in os.getenv("ODYSSEUS_PROXY_OLLAMA_HOSTS", "").split(",")
+        if h.strip()
+    )
+    return any(host == h or host.endswith(f".{h}") for h in proxy_hosts)
+
+
 def is_local_endpoint(url: str) -> bool:
     """Check if URL points to a local/private/tailscale address."""
     kind = _configured_endpoint_kind(url)
-    if kind in ("api", "proxy"):
+    if kind == "api":
         return False
     if kind == "local":
         return True
     try:
-        host = urlparse(url).hostname or ""
-        return host in _LOCAL_HOSTS or _is_private_ip_literal(host) or _in_tailscale_range(host)
+        host = (urlparse(url).hostname or "").lower()
     except Exception:
         return False
+    if _is_configured_ollama_proxy_host(host):
+        return True
+    if kind == "proxy":
+        return False
+    return host in _LOCAL_HOSTS or _is_private_ip_literal(host) or _in_tailscale_range(host)
 
 # ---------------------------------------------------------------------------
 # Constants

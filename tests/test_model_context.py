@@ -91,6 +91,21 @@ class TestIsLocalEndpoint:
 
         assert is_local_endpoint("http://100.117.136.97:34521/v1/chat/completions") is False
 
+    def test_configured_ollama_proxy_host_is_local(self, monkeypatch):
+        """openai.craftshost.com fronts this host's GPU — serialize through it."""
+        monkeypatch.setenv("ODYSSEUS_PROXY_OLLAMA_HOSTS", "openai.craftshost.com")
+        _install_endpoint_db(monkeypatch, [
+            types.SimpleNamespace(
+                base_url="https://openai.craftshost.com/v1",
+                endpoint_kind="proxy",
+                api_key="fake-key",
+                is_enabled=True,
+            )
+        ])
+        assert is_local_endpoint(
+            "https://openai.craftshost.com/v1/chat/completions"
+        ) is True
+
     def test_openai_is_remote(self):
         assert is_local_endpoint("https://api.openai.com/v1/chat/completions") is False
 
