@@ -1396,7 +1396,13 @@ def _parse_concatenated_json_objects(raw: str) -> Optional[dict]:
             objects.append(obj)
         idx = end
     non_empty = [o for o in objects if o]
-    return non_empty[-1] if non_empty else None
+    if non_empty:
+        return non_empty[-1]
+    # A well-formed sequence of empty objects (e.g. '{}{}') is still a valid
+    # "no arguments" emission — the model called the RIGHT tool (seen live:
+    # mcp project-all with '{}{}'). Return empty args and let the tool's own
+    # validation reject it loudly if arguments were actually required.
+    return {} if objects else None
 
 
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:

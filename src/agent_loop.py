@@ -3553,6 +3553,7 @@ async def stream_agent_loop(
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
     _low_signal_turn = bool(_intent.get("low_signal"))
+    _continuation_turn = bool(_intent.get("continuation"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
     _active_document_relevant = _turn_targets_active_document(_intent, _last_user, active_document)
@@ -4220,7 +4221,7 @@ async def stream_agent_loop(
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
-    if _low_signal_turn and _relevant_tools:
+    if (_low_signal_turn or _continuation_turn) and _relevant_tools:
         _recent_tools = _recent_session_tool_names(messages) - set(disabled_tools or ())
         if _recent_tools:
             _relevant_tools = set(_relevant_tools) | _recent_tools
