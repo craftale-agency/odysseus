@@ -1367,6 +1367,38 @@ def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[d
     return None
 
 
+def _parse_concatenated_json_objects(raw: str) -> Optional[dict]:
+    """Recover args from models that emit several JSON objects glued together.
+
+    Seen in the wild (qwen3.5:9b on parallel tool calls): an empty ``{}``
+    emitted immediately before the real arguments produces
+    ``'{}{"q": "", "limit": 50}'``. json.loads rejects the concatenation and
+    the whole call used to be silently dropped — surfacing to the user as an
+    empty agent round ("no substantive output"). Parse as a raw_decode
+    sequence and keep the last non-empty object (the real args).
+    """
+    s = raw.strip()
+    if not s.startswith("{") or not s.endswith("}"):
+        return None
+    decoder = json.JSONDecoder()
+    objects: list = []
+    idx = 0
+    while idx < len(s):
+        while idx < len(s) and s[idx] in " \t\r\n":
+            idx += 1
+        if idx >= len(s):
+            break
+        try:
+            obj, end = decoder.raw_decode(s, idx)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(obj, dict):
+            objects.append(obj)
+        idx = end
+    non_empty = [o for o in objects if o]
+    return non_empty[-1] if non_empty else None
+
+
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
     """Convert a native function call into a ToolBlock for the existing execution pipeline."""
     tool_type = _TOOL_NAME_MAP.get(name, name)
@@ -1380,6 +1412,10 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         if args is not None:
             logger.warning(f"Repaired malformed document function call arguments for {name}")
         else:
+            args = _parse_concatenated_json_objects(arguments) if isinstance(arguments, str) else None
+            if args is not None:
+                logger.info(f"Recovered concatenated JSON tool arguments for {name}: kept last of multiple objects")
+        if args is None:
             logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
             return None
 
