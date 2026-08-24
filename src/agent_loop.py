@@ -1041,7 +1041,7 @@ def _agent_route_tool_mode(
         logger.debug("endpoint supports_tools lookup failed: %s", exc)
 
     model_supports_tools = any(kw in model_lc for kw in (
-        "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma",
+        "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma", "thinker",
         "qwen3", "qwen2.5", "mixtral", "mistral", "llama-3.1", "llama-3.2",
         "llama-3.3", "llama-4", "llama3.1", "llama3.2", "llama3.3", "llama4",
         "minimax", "kimi", "yi-", "phi-3", "phi-4", "command-r",
