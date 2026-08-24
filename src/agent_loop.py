@@ -4400,6 +4400,18 @@ async def stream_agent_loop(
     messages = _route_state["messages"]
     mcp_schemas = _route_state["mcp_schemas"]
     _relevant_tools = _route_state["relevant_tools"]
+    # The route state overwrites the tool-selection result (including the
+    # continuation merge above) — re-apply it so recently-used session tools
+    # survive into the rounds (2026-08-24: merge logged, then vanished from
+    # tools_sent 20ms later because this assignment clobbered it).
+    if (_low_signal_turn or _continuation_turn) and _relevant_tools is not None:
+        _rt_keep = _recent_session_tool_names(messages) - set(disabled_tools or ())
+        if _rt_keep and not _rt_keep.issubset(_relevant_tools):
+            _relevant_tools = set(_relevant_tools) | _rt_keep
+            logger.info(
+                "[tool-rag] Route state reapplied; re-merged %d continuation tools",
+                len(_rt_keep),
+            )
     _is_api_model = _route_state["is_api_model"]
     _is_ollama_native = _route_state["is_ollama_native"]
     _ollama_openai_compat = _route_state["ollama_openai_compat"]
