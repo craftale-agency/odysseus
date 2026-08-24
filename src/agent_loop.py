@@ -3419,6 +3419,32 @@ def _detect_runaway_call(call_freq, threshold=3):
     return sig.split(":", 1)[0] if sig else None
 
 
+def _recent_session_tool_names(messages: List[Dict], limit: int = 12) -> set:
+    """Tool names used in the conversation's recent assistant turns.
+
+    A short continuation ("yes", "continue", "proceed") carries no keywords
+    for RAG retrieval, so the turn used to start with a nearly-empty toolset
+    — the model narrated its intent, had nothing to call, and the turn ended
+    ("it just stops"). Merging recently-used tools keeps the working set
+    alive across continuation turns.
+    """
+    names: set = set()
+    if not isinstance(messages, list):
+        return names
+    for message in reversed(messages[-limit:]):
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for event in metadata.get("tool_events") or []:
+            if isinstance(event, dict):
+                name = _resolved_tool_event_name(event)
+                if name:
+                    names.add(name)
+    return names
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -4194,6 +4220,15 @@ async def stream_agent_loop(
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
+    if _low_signal_turn and _relevant_tools:
+        _recent_tools = _recent_session_tool_names(messages) - set(disabled_tools or ())
+        if _recent_tools:
+            _relevant_tools = set(_relevant_tools) | _recent_tools
+            logger.info(
+                "[tool-rag] Continuation turn: merged %d recently-used session tools (%s)",
+                len(_recent_tools),
+                ", ".join(sorted(_recent_tools)[:8]),
+            )
     prep_timings["tool_selection"] = time.time() - _t1
 
     _t2 = time.time()
