@@ -351,6 +351,106 @@ def test_explicit_foreground_policy_does_not_fallback_on_empty_completion(monkey
     assert "returned no substantive output" in chunks[0]
 
 
+def _run_fallback_sequence(monkeypatch, outputs, **fallback_kwargs):
+    """Drive stream_llm_with_fallback with one canned output list per ATTEMPT.
+
+    Unlike `_run_fallback` (which keys on model name), this consumes `outputs`
+    in order so a same-model retry can be scripted with different results.
+    Returns (chunks, attempt_models)."""
+    attempts = []
+
+    async def stream_factory(url, model, messages, **kw):
+        index = len(attempts)
+        attempts.append(model)
+        for ln in (outputs[index] if index < len(outputs) else ["data: [DONE]\n\n"]):
+            yield ln
+
+    monkeypatch.setattr(llm_core, "stream_llm", stream_factory)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("u1", "primary", {}), ("u2", "backup", {})],
+            [{"role": "user", "content": "hi"}],
+            **fallback_kwargs,
+        ):
+            out.append(c)
+        return out
+
+    return asyncio.run(run()), attempts
+
+
+def test_empty_retry_recovers_on_same_model_without_fallback_event(monkeypatch):
+    chunks, attempts = _run_fallback_sequence(
+        monkeypatch,
+        [
+            ["data: [DONE]\n\n"],                                    # primary, attempt 1: empty
+            ['data: {"delta": "recovered"}\n\n', "data: [DONE]\n\n"],  # primary, attempt 2
+        ],
+        fallback_statuses={408, 425, 429, 500, 502, 503, 504, 507, 508, 529},
+        fallback_on_empty=True,
+        empty_retry_attempts=1,
+    )
+
+    assert attempts == ["primary", "primary"]
+    assert any('"delta": "recovered"' in c for c in chunks)
+    assert not any('"type": "fallback"' in c for c in chunks)
+    assert not any(c.startswith("event: error") for c in chunks)
+
+
+def test_empty_retry_exhausted_advances_to_fallback_candidate(monkeypatch):
+    chunks, attempts = _run_fallback_sequence(
+        monkeypatch,
+        [
+            ["data: [DONE]\n\n"],                                      # primary, attempt 1: empty
+            ["data: [DONE]\n\n"],                                      # primary, attempt 2: empty
+            ['data: {"delta": "backup answer"}\n\n', "data: [DONE]\n\n"],  # backup
+        ],
+        fallback_statuses={408, 425, 429, 500, 502, 503, 504, 507, 508, 529},
+        fallback_on_empty=True,
+        empty_retry_attempts=1,
+    )
+
+    assert attempts == ["primary", "primary", "backup"]
+    fb = [json.loads(c[6:]) for c in chunks if c.startswith("data: ") and '"fallback"' in c]
+    assert fb and fb[0]["answered_by"] == "backup"
+    assert any('"delta": "backup answer"' in c for c in chunks)
+    assert not any(c.startswith("event: error") for c in chunks)
+
+
+def test_empty_retry_disabled_keeps_strict_single_attempt(monkeypatch):
+    chunks, attempts = _run_fallback_sequence(
+        monkeypatch,
+        [["data: [DONE]\n\n"]],
+        fallback_statuses={408, 425, 429, 500, 502, 503, 504, 507, 508, 529},
+        fallback_on_empty=False,
+        empty_retry_attempts=1,
+    )
+
+    # fallback_on_empty=False gates the retry too: strict callers see the
+    # historical single-attempt behavior unchanged.
+    assert attempts == ["primary"]
+    assert len(chunks) == 1
+    assert chunks[0].startswith("event: error")
+    assert "returned no substantive output" in chunks[0]
+
+
+def test_all_candidates_empty_after_retries_surfaces_terminal_error(monkeypatch):
+    chunks, attempts = _run_fallback_sequence(
+        monkeypatch,
+        [["data: [DONE]\n\n"]] * 4,  # primary x2, backup x2 — all empty
+        fallback_statuses={408, 425, 429, 500, 502, 503, 504, 507, 508, 529},
+        fallback_on_empty=True,
+        empty_retry_attempts=1,
+    )
+
+    assert attempts == ["primary", "primary", "backup", "backup"]
+    errors = [c for c in chunks if c.startswith("event: error")]
+    assert len(errors) == 1
+    assert "All model candidates returned no substantive output" in errors[0]
+    assert '"status": 502' in errors[0]
+
+
 def test_explicit_foreground_policy_respects_adapter_ineligible_override(monkeypatch):
     calls = []
     terminal = 'event: error\ndata: {"status": 502, "error": "local adapter failure", "fallback_eligible": false}\n\n'

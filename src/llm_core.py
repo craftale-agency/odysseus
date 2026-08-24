@@ -3599,10 +3599,20 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     through unchanged. The dead-host cooldown in stream_llm makes repeat
     attempts at an offline primary effectively instant.
 
+    A candidate whose stream ends WITHOUT substantive output (the empty-round
+    failure mode: thinking models that burn their budget and stream a clean
+    EOF) is retried on the SAME model up to ``empty_retry_attempts`` extra
+    times before the chain advances — an empty output is often transient, and
+    a same-model retry preserves the user's selection where a fallback would
+    abandon it. Retries only apply when ``fallback_on_empty`` is true (empty
+    completions must be recoverable at all); callers that keep the strict
+    ``fallback_on_empty=False`` see zero behavior change.
+
     Yields the same SSE chunk protocol as stream_llm.
     """
     fallback_statuses = kwargs.pop("fallback_statuses", None)
     fallback_on_empty = bool(kwargs.pop("fallback_on_empty", True))
+    empty_retry_attempts = max(0, int(kwargs.pop("empty_retry_attempts", 0) or 0))
     candidate_request_factory = kwargs.pop("candidate_request_factory", None)
     candidate_route_descriptors = kwargs.pop("candidate_route_descriptors", None)
     eligible_statuses = None if fallback_statuses is None else frozenset(fallback_statuses)
@@ -3666,124 +3676,145 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                     continue
                 yield error_chunk
                 return
-        candidate_stream = stream_llm(
-            url,
-            model,
-            candidate_messages,
-            headers=headers,
-            **candidate_kwargs,
-        )
-        try:
-            async for chunk in candidate_stream:
-                if chunk.startswith("event: error"):
-                    status = _stream_error_status(chunk)
-                    eligibility_override = _stream_error_fallback_override(chunk)
-                    eligible = (
-                        True
-                        if eligible_statuses is None
-                        else (
-                            eligibility_override
-                            if eligibility_override is not None
-                            else status in eligible_statuses
-                        )
-                    )
-                    if not emitted and not is_last and eligible:
-                        # Pre-content failure with fallbacks left — swallow and
-                        # move to the next candidate.
-                        last_error = chunk
-                        failures.append({
-                            "candidate_index": i,
-                            "model": model,
-                            "status": status,
-                            "reason": _summarize_stream_error(chunk),
-                        })
-                        retried = True
-                        if i == 0:
-                            logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
-                        else:
-                            logger.warning(f"[fallback] candidate {model} failed; trying next")
-                        break
-                    if not emitted:
-                        # A last-candidate error is already the clearest terminal
-                        # result; do not append an empty-completion error as well.
-                        yield chunk
-                        return
-                    yield chunk
-                    continue
-
-                event_data = {}
-                is_done = chunk.startswith("data: [DONE]")
-                if chunk.startswith("data: ") and not is_done:
-                    try:
-                        event_data = json.loads(chunk[6:])
-                    except Exception:
-                        pass
-
-                delta = event_data.get("delta")
-                event_type = event_data.get("type")
-                substantive = (
-                    isinstance(delta, str) and bool(delta.strip())
-                ) or (
-                    event_type == "tool_calls"
-                    and bool(event_data.get("calls"))
+        attempts_allowed = 1 + (empty_retry_attempts if fallback_on_empty else 0)
+        for attempt_index in range(attempts_allowed):
+            if attempt_index:
+                # Same-model retry: an empty completion is often transient
+                # (thinking budget exhaustion, sampling hiccup). Retrying the
+                # same route preserves the user's selection where advancing
+                # to a fallback would abandon it for the rest of the run.
+                _attempt_tag = "primary" if i == 0 else "candidate"
+                logger.warning(
+                    "[fallback] %s %s returned no substantive output; "
+                    "retrying same model (attempt %d of %d)",
+                    _attempt_tag,
+                    model,
+                    attempt_index + 1,
+                    attempts_allowed,
                 )
-
-                if substantive and not emitted:
-                    # First real output from a NON-primary candidate: tell the client
-                    # the selected model failed and another answered. Without this the
-                    # fallback is invisible — a misconfigured provider looks like it
-                    # works because the reply is shown under the originally selected
-                    # model's name (e.g. a Bedrock/Claude endpoint that 400s every
-                    # request but appears fine because another model silently answered).
-                    if i > 0:
-                        primary_reason = (
-                            failures[0]["reason"]
-                            if failures
-                            else _summarize_stream_error(last_error)
+                pending_metadata = []
+            candidate_stream = stream_llm(
+                url,
+                model,
+                candidate_messages,
+                headers=headers,
+                **candidate_kwargs,
+            )
+            try:
+                async for chunk in candidate_stream:
+                    if chunk.startswith("event: error"):
+                        status = _stream_error_status(chunk)
+                        eligibility_override = _stream_error_fallback_override(chunk)
+                        eligible = (
+                            True
+                            if eligible_statuses is None
+                            else (
+                                eligibility_override
+                                if eligibility_override is not None
+                                else status in eligible_statuses
+                            )
                         )
-                        yield ('data: ' + json.dumps({
-                            "type": "fallback",
-                            "selected_model": primary_model,
-                            "answered_by": model,
-                            "selected_endpoint_id": primary_route.get("endpoint_id"),
-                            "selected_endpoint_label": primary_route.get("endpoint_label"),
-                            "selected_endpoint_cost_tracked": primary_route.get("endpoint_cost_tracked"),
-                            "answered_by_endpoint_id": route_descriptors[i].get("endpoint_id"),
-                            "answered_by_endpoint_label": route_descriptors[i].get("endpoint_label"),
-                            "answered_by_endpoint_cost_tracked": route_descriptors[i].get("endpoint_cost_tracked"),
-                            "candidate_index": i,
-                            "reason": primary_reason,
-                            "failures": [
-                                {
-                                    "candidate_index": failure["candidate_index"],
-                                    "model": failure["model"],
-                                    "status": failure["status"],
-                                }
-                                for failure in failures
-                            ],
-                        }) + '\n\n')
-                    # Metadata must not commit a candidate. Once real output arrives,
-                    # flush it after any fallback notice and before the output itself.
-                    for metadata_chunk in pending_metadata:
-                        yield metadata_chunk
-                    pending_metadata.clear()
-                    emitted = True
+                        if not emitted and not is_last and eligible:
+                            # Pre-content failure with fallbacks left — swallow and
+                            # move to the next candidate.
+                            last_error = chunk
+                            failures.append({
+                                "candidate_index": i,
+                                "model": model,
+                                "status": status,
+                                "reason": _summarize_stream_error(chunk),
+                            })
+                            retried = True
+                            if i == 0:
+                                logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
+                            else:
+                                logger.warning(f"[fallback] candidate {model} failed; trying next")
+                            break
+                        if not emitted:
+                            # A last-candidate error is already the clearest terminal
+                            # result; do not append an empty-completion error as well.
+                            yield chunk
+                            return
+                        yield chunk
+                        continue
 
-                if substantive or emitted:
-                    yield chunk
-                elif not is_done:
-                    pending_metadata.append(chunk)
-        finally:
-            close_candidate = getattr(candidate_stream, "aclose", None)
-            if callable(close_candidate):
-                try:
-                    await close_candidate()
-                except Exception as close_error:
-                    logger.warning(
-                        "[fallback] failed to close candidate %s stream: %s",
-                        model,
-                        type(close_error).__name__,
+                    event_data = {}
+                    is_done = chunk.startswith("data: [DONE]")
+                    if chunk.startswith("data: ") and not is_done:
+                        try:
+                            event_data = json.loads(chunk[6:])
+                        except Exception:
+                            pass
+
+                    delta = event_data.get("delta")
+                    event_type = event_data.get("type")
+                    substantive = (
+                        isinstance(delta, str) and bool(delta.strip())
+                    ) or (
+                        event_type == "tool_calls"
+                        and bool(event_data.get("calls"))
                     )
+
+                    if substantive and not emitted:
+                        # First real output from a NON-primary candidate: tell the client
+                        # the selected model failed and another answered. Without this the
+                        # fallback is invisible — a misconfigured provider looks like it
+                        # works because the reply is shown under the originally selected
+                        # model's name (e.g. a Bedrock/Claude endpoint that 400s every
+                        # request but appears fine because another model silently answered).
+                        if i > 0:
+                            primary_reason = (
+                                failures[0]["reason"]
+                                if failures
+                                else _summarize_stream_error(last_error)
+                            )
+                            yield ('data: ' + json.dumps({
+                                "type": "fallback",
+                                "selected_model": primary_model,
+                                "answered_by": model,
+                                "selected_endpoint_id": primary_route.get("endpoint_id"),
+                                "selected_endpoint_label": primary_route.get("endpoint_label"),
+                                "selected_endpoint_cost_tracked": primary_route.get("endpoint_cost_tracked"),
+                                "answered_by_endpoint_id": route_descriptors[i].get("endpoint_id"),
+                                "answered_by_endpoint_label": route_descriptors[i].get("endpoint_label"),
+                                "answered_by_endpoint_cost_tracked": route_descriptors[i].get("endpoint_cost_tracked"),
+                                "candidate_index": i,
+                                "reason": primary_reason,
+                                "failures": [
+                                    {
+                                        "candidate_index": failure["candidate_index"],
+                                        "model": failure["model"],
+                                        "status": failure["status"],
+                                    }
+                                    for failure in failures
+                                ],
+                            }) + '\n\n')
+                        # Metadata must not commit a candidate. Once real output arrives,
+                        # flush it after any fallback notice and before the output itself.
+                        for metadata_chunk in pending_metadata:
+                            yield metadata_chunk
+                        pending_metadata.clear()
+                        emitted = True
+
+                    if substantive or emitted:
+                        yield chunk
+                    elif not is_done:
+                        pending_metadata.append(chunk)
+            finally:
+                close_candidate = getattr(candidate_stream, "aclose", None)
+                if callable(close_candidate):
+                    try:
+                        await close_candidate()
+                    except Exception as close_error:
+                        logger.warning(
+                            "[fallback] failed to close candidate %s stream: %s",
+                            model,
+                            type(close_error).__name__,
+                        )
+            if emitted:
+                return
+            if retried:
+                break
 
         if emitted:
             return

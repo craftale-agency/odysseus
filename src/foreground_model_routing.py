@@ -31,6 +31,12 @@ class ForegroundModelPolicy:
     fallback_descriptors: Tuple[dict, ...] = ()
     eligible_statuses: FrozenSet[int] = FOREGROUND_AVAILABILITY_STATUSES
     fallback_on_empty: bool = False
+    # Extra same-model attempts when a stream ends with no substantive output.
+    # An empty completion is usually transient (thinking budget exhaustion),
+    # so the selected model gets one immediate retry before the chain walks
+    # the fallback candidates — a retry keeps the user's selection where a
+    # fallback would abandon it for the rest of the agent run.
+    empty_retry_attempts: int = 0
 
 
 def _load_policy_preferences(owner: Optional[str]) -> dict:
@@ -143,6 +149,12 @@ def resolve_foreground_model_policy(
         fallback_descriptors=tuple(
             dict(descriptor) for _candidate, descriptor in resolved_routes
         ),
+        # An opted-in chain treats an empty round as recoverable: retry the
+        # same model once, then walk the configured candidates, and only then
+        # surface the 502. (2026-08-25: thinker14b agent rounds died on the
+        # first empty completion because fallback_on_empty was never set.)
+        fallback_on_empty=True,
+        empty_retry_attempts=1,
     )
 
 

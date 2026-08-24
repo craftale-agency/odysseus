@@ -1867,7 +1867,10 @@ def test_foreground_policy_resolves_ordered_owner_scoped_entries(monkeypatch):
         ("https://backup.example/v1", "backup", {"Authorization": "secret"}),
     )
     assert policy.eligible_statuses == FOREGROUND_AVAILABILITY_STATUSES
-    assert policy.fallback_on_empty is False
+    # An opted-in chain recovers from empty rounds: one same-model retry,
+    # then the configured candidates, before any 502 is surfaced.
+    assert policy.fallback_on_empty is True
+    assert policy.empty_retry_attempts == 1
     assert seen == {
         "entries": entries[:MAX_FOREGROUND_FALLBACKS],
         "owner": "alice",
@@ -3122,7 +3125,11 @@ def test_force_answer_recovery_persists_and_bills_pinned_fallback_route(
         (primary[0], primary[1]),
         (backup[0], backup[1]),
     ]
-    assert requests_by_round[1:] == [[(backup[0], backup[1])]] * 5
+    # The identical-call runaway detector trips at frequency 3 (tightened in
+    # 7bde893c for the 2026-08-23 qwen3.5 manage_memory loop), so the repeat
+    # rides rounds 2-3, the loop-breaker fires at the END of round 3, and
+    # round 4 is the forced tool-free recovery round.
+    assert requests_by_round[1:] == [[(backup[0], backup[1])]] * 3
     assert len(synthesis_calls) == 1
     assert synthesis_calls[0]["url"] == backup[0]
     assert synthesis_calls[0]["model"] == backup[1]
@@ -3135,7 +3142,7 @@ def test_force_answer_recovery_persists_and_bills_pinned_fallback_route(
     assert metrics["round_models"][-1] == backup[1]
     assert metrics["round_endpoint_ids"][-1] == "backup-ep"
     assert metrics["usage_buckets"][-1] == {
-        "round": 6,
+        "round": 4,
         "model": backup[1],
         "endpoint_id": "backup-ep",
         "endpoint_label": "Backup",
@@ -3144,7 +3151,7 @@ def test_force_answer_recovery_persists_and_bills_pinned_fallback_route(
         "usage_source": "estimated",
         "endpoint_cost_tracked": True,
     }
-    assert len(metrics["usage_buckets"]) == 7
+    assert len(metrics["usage_buckets"]) == 5
 
 
 def test_agent_terminal_retains_completed_paid_fallback_usage(monkeypatch):

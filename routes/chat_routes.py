@@ -1944,6 +1944,7 @@ def setup_chat_routes(
                         session_id=session,
                         fallback_statuses=_foreground_policy.eligible_statuses,
                         fallback_on_empty=_foreground_policy.fallback_on_empty,
+                        empty_retry_attempts=_foreground_policy.empty_retry_attempts,
                         candidate_request_factory=_chat_request_factory,
                         candidate_route_descriptors=_foreground_route_descriptors,
                     ):
@@ -2313,6 +2314,7 @@ def setup_chat_routes(
                         route_descriptors=_foreground_route_descriptors,
                         fallback_statuses=_foreground_policy.eligible_statuses,
                         fallback_on_empty=_foreground_policy.fallback_on_empty,
+                        empty_retry_attempts=_foreground_policy.empty_retry_attempts,
                         plan_mode=plan_mode,
                         approved_plan=approved_plan or None,
                         workspace=workspace or None,

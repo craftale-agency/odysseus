@@ -3466,6 +3466,7 @@ async def stream_agent_loop(
     route_descriptors: Optional[List[dict]] = None,
     fallback_statuses: Optional[Set[int]] = None,
     fallback_on_empty: bool = True,
+    empty_retry_attempts: int = 0,
     plan_mode: bool = False,
     approved_plan: Optional[str] = None,
     tool_policy: Optional[ToolPolicy] = None,
@@ -3724,6 +3725,7 @@ async def stream_agent_loop(
                 workload=workload,
                 fallback_statuses=fallback_statuses,
                 fallback_on_empty=fallback_on_empty,
+                empty_retry_attempts=empty_retry_attempts,
                 candidate_request_factory=_direct_candidate_request,
                 candidate_route_descriptors=route_descriptors,
             ):
@@ -4998,6 +5000,7 @@ async def stream_agent_loop(
             workload=workload,
             fallback_statuses=fallback_statuses,
             fallback_on_empty=fallback_on_empty,
+            empty_retry_attempts=empty_retry_attempts,
             candidate_request_factory=_candidate_request,
             candidate_route_descriptors=_candidate_route_descriptors,
         ):
