@@ -1352,6 +1352,113 @@ def _is_contextual_retry_continuation(messages: List[Dict], text: str) -> bool:
     return bool(_COOKBOOK_CONTEXT_RE.search(recent))
 
 
+# ── Trailing-intent continuation guard (2026-08-27 stall class) ──────────
+# Ollama's qwen3.5 native tool-call parsers (qwen35.go + qwen3coder.go
+# fallback) can fail on a mismatched closing tag and then SILENTLY DROP the
+# whole call: the round ends clean (HTTP 200, finish=stop) with only the
+# narration text delivered. Downstream that reads as "0 tool deltas +
+# substantive prose" = a final answer, so the turn completes and the
+# promised action never runs ("chat just stopped after 'Let me ...:'").
+# A single re-roll almost always parses, so this guard appends ONE extra
+# round with a firm nudge when the round really looks unfinished.
+_TRAILING_INTENT_VERB_RE = re.compile(
+    r"(?:let me|i'?ll|i will|now i(?:'m| am)?|going to)\s+"
+    r"(?:create|save|run|check|fetch|add|set|update|list|search|"
+    r"write|make|build|tail|read|inspect|verify|examine|grab|pull|"
+    r"view|call|trigger|launch|start|stop|kill|restart|register|"
+    r"find|query|test|send|open|close|delete|remove|install|deploy)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+# Tight browser-action vocabulary. Deliberately stricter than the route
+# layer's _explicit_browser_intent regex ("click"/"fill"/"submit" alone are
+# far too common on task turns) — this is only consulted when deciding
+# whether browser MCP tools may be pruned from a workspace turn.
+_BROWSER_ACTION_WORDS_RE = re.compile(
+    r"\b(browser|browsing|playwright|screenshot|screenshots|navigate|"
+    r"navigation|web\s*form|scrape|scraping|"
+    r"click\s+(?:on\s+)?(?:the|this|that|it|them|any|a|an|button|link|"
+    r"element|item|option|tab)\b|"
+    r"open\s+(?:the\s+|this\s+)?(?:site|website|page|url|link)\b|"
+    r"fill\s+(?:out|in)\s+(?:the|this|that|a)\s+form|"
+    r"log\s*in\s+(?:to|on|and)|login\s+page|sign\s*in\s+page)"
+    r"",
+    re.IGNORECASE,
+)
+
+
+def _trailing_intent_retry_needed(
+    round_text: str,
+    tools_sent_count: int,
+    tool_calls_this_turn: int,
+    retry_used: bool,
+    max_chars: int = 400,
+) -> bool:
+    """Whether a 0-tool-call round should get ONE firm call-the-tool nudge.
+
+    Fires only when ALL hold:
+      (a) tools were offered this round (tools_sent_count > 0) — with no
+          tools in play, narration-only is a legitimate answer shape;
+      (b) ZERO tool calls in the entire turn so far — post-tool summaries
+          like "Here are your emails:" never match even though they end
+          with a colon;
+      (c) the final text reads as about-to-act intent: it ends with a
+          dangling ':' OR matches an intent verb phrase ("Let me create",
+          "I'll save", "going to add", ...);
+      (d) the retry has not been used yet this turn (hard cap 1 — the
+          guard can never loop).
+
+    Kept as a pure function so the trigger conditions are unit-testable.
+    """
+    if retry_used:
+        return False
+    if tools_sent_count <= 0:
+        return False
+    if tool_calls_this_turn > 0:
+        return False
+    text = str(round_text or "").strip()
+    if not text:
+        return False
+    if len(text) > max_chars:
+        # Long substantive text is an answer, not a dangling promise.
+        return False
+    if "```" in text:
+        # Fenced content (code/answer) means the round delivered something.
+        return False
+    ends_with_colon = text.endswith(":") or text.endswith("：")
+    return ends_with_colon or bool(_TRAILING_INTENT_VERB_RE.search(text))
+
+
+def _prune_browser_tools_for_workspace_turn(
+    relevant_tools: Optional[Set[str]],
+    turn_context_text: str,
+) -> Set[str]:
+    """Browser MCP names to drop from a workspace/Terminus-classified turn.
+
+    A turn can be clamped to the Terminus toolset AND carry forced browser
+    tools (the route layer's loose browser-intent regex matches bare
+    "click"/"fill"/"submit"), which _expand_browser_mcp_tools then blows up
+    to every connected Playwright tool — 59 schemas in the 2026-08-27
+    incident vs 10-18 on healthy rounds. Fat tool surfaces raise the odds
+    of malformed native tool-call XML on local models. Workspace turns
+    almost never need Playwright, so return the browser names to drop —
+    UNLESS the turn's own words name browser actions, in which case the
+    flow may legitimately need them and nothing is dropped.
+
+    Pure function for testability; callers log the outcome.
+    """
+    if not relevant_tools:
+        return set()
+    if _BROWSER_ACTION_WORDS_RE.search(str(turn_context_text or "")):
+        return set()
+    return {
+        name
+        for name in relevant_tools
+        if name == "builtin_browser" or name.startswith(_BROWSER_MCP_PREFIX)
+    }
+
+
 def _assistant_requested_followup(messages: List[Dict]) -> bool:
     """True when the previous assistant turn asked for missing task details.
 
@@ -3978,6 +4085,7 @@ async def stream_agent_loop(
     # tool names. It prevents obvious requests like "last 5 emails" from
     # collapsing to only ask_user/manage_memory when vector retrieval misses or
     # times out.
+    _terminus_clamped = False
     if not guide_only and _relevant_tools is not None:
         for _domain in (_intent.get("domains") or set()):
             _relevant_tools.update(_DOMAIN_TOOL_MAP.get(str(_domain), set()))
@@ -4013,6 +4121,7 @@ async def stream_agent_loop(
             and not active_email
         ):
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
+            _terminus_clamped = True
             logger.info("[tool-rag] Workspace file/terminal request; using Odysseus Terminus toolset")
 
     # If this turn targets the open document, keep editing tools available
@@ -4053,6 +4162,30 @@ async def stream_agent_loop(
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update(forced_set)
+
+    # ── Workspace-turn browser-tool prune (tool-surface reduction) ────
+    # 2026-08-27 incident: a Terminus-clamped turn ALSO carried forced
+    # browser tools (route regex matched bare "click"/"fill"/"submit" in
+    # the user text), which _expand_browser_mcp_tools blew up to every
+    # connected Playwright tool — 59 schemas vs 10-18 on healthy rounds.
+    # Fat tool surfaces raise the odds of malformed native tool-call XML
+    # on local models. On workspace turns, drop browser MCP names unless
+    # the turn's own words (or the approved plan) name browser actions.
+    # The continuation merge further down can still re-add browser names
+    # when the session genuinely used them recently — mid-flow browser
+    # turns keep their tools.
+    if not guide_only and _terminus_clamped and _relevant_tools is not None:
+        _turn_context_for_prune = f"{_last_user or ''}\n{approved_plan or ''}"
+        _pruned_browser = _prune_browser_tools_for_workspace_turn(
+            _relevant_tools, _turn_context_for_prune
+        )
+        if _pruned_browser:
+            _relevant_tools.difference_update(_pruned_browser)
+            logger.info(
+                "[tool-surface] workspace turn pruned %d browser MCP tools "
+                "(no browser-action words in turn context)",
+                len(_pruned_browser),
+            )
 
     if not guide_only and _relevant_tools is not None:
         _relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)
@@ -4494,6 +4627,10 @@ async def stream_agent_loop(
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
+    # Trailing-intent continuation guard (2026-08-27 stall class): one
+    # recovery retry per turn when a 0-tool round ends on about-to-act
+    # narration (Ollama silently dropped a malformed native tool call).
+    _trailing_intent_retry_used = False
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -5520,6 +5657,44 @@ async def stream_agent_loop(
                     # never re-verify an unchanged state in a loop.
                     _effectful_used = False
                     continue
+            # ── Trailing-intent continuation guard ────────────────────
+            # Recovery net for the 2026-08-27 stall class: Ollama
+            # (qwen3.5 native XML) can emit a tool call with a mismatched
+            # closing tag, fail to parse it, and SILENTLY DROP it — the
+            # round ends clean (200/stop) with only narration delivered
+            # ("Let me create them:"), which reads as a final answer.
+            # When the round really looks unfinished we append ONE firm
+            # nudge round; a re-roll almost always parses. Distinct log
+            # line so recoveries vs false positives are countable.
+            if not guide_only and not _force_answer and _trailing_intent_retry_needed(
+                round_text=_strip_think_blocks(cleaned_round).strip(),
+                tools_sent_count=len(_tool_names_sent or []),
+                tool_calls_this_turn=len(tool_events),
+                retry_used=_trailing_intent_retry_used,
+            ):
+                _trailing_intent_retry_used = True
+                _guard_tail = _strip_think_blocks(cleaned_round).strip()[-90:]
+                logger.warning(
+                    "[agent-guard] trailing_intent_retry session=%s round=%s "
+                    "tools_sent=%s text_tail=%r",
+                    session_id or "-",
+                    round_num,
+                    len(_tool_names_sent or []),
+                    _guard_tail,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You just stated an intention to perform an action but "
+                        "made no tool call. The tool call was lost or not "
+                        "generated. Call the appropriate tool NOW — do not "
+                        "narrate, do not ask the user, do not restate the "
+                        "plan. Emit the actual function call this turn."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "trailing_intent_retry", "round": round_num, "tools_sent": len(_tool_names_sent or [])})}\n\n'
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
             # ── Intent-without-action supervisor ─────────────────────
             # Catch "Let me tail the output" / "I'll check the logs" /
             # "Let me investigate" patterns where the model announces an

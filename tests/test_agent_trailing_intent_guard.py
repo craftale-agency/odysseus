@@ -1,0 +1,297 @@
+"""Trailing-intent continuation guard + workspace browser-tool prune.
+
+2026-08-27 stall class (session 3cd660b2): qwen3.5:9b emitted a native-XML
+tool call with a mismatched closing tag; Ollama's parsers (qwen35.go +
+qwen3coder.go) failed and SILENTLY DROPPED it, so the round ended clean
+(HTTP 200, finish=stop) with only the narration ("Let me create them:")
+delivered. The agent loop read "0 tool calls + substantive text" as a
+final answer and the turn completed without ever running the action.
+
+Two layers ship together:
+  1. `_trailing_intent_retry_needed` — one firm recovery round when a
+     0-tool round ends on about-to-act narration (tools were offered,
+     nothing called all turn, cap 1 per turn).
+  2. `_prune_browser_tools_for_workspace_turn` — the failing round carried
+     59 tools (Terminus + 30 browser MCP via forced-tools) vs 10-18 on
+     healthy rounds; workspace turns drop browser MCP names unless the
+     turn's words name browser actions.
+"""
+
+import asyncio
+import json
+
+import src.agent_loop as al
+
+
+# ── pure function: trigger conditions ────────────────────────────────────
+
+def test_retry_needed_on_incident_shape():
+    # The exact incident shape: short narration ending on a dangling colon.
+    assert al._trailing_intent_retry_needed(
+        round_text="Let me create them:",
+        tools_sent_count=59,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_retry_needed_on_verb_without_colon():
+    assert al._trailing_intent_retry_needed(
+        round_text="I'll save all six tasks in your todo list now",
+        tools_sent_count=12,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+    assert al._trailing_intent_retry_needed(
+        round_text="Now I run the migration",
+        tools_sent_count=3,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+    assert al._trailing_intent_retry_needed(
+        round_text="going to add the entries",
+        tools_sent_count=3,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_retry_blocked_when_already_used():
+    # Hard cap 1 — the guard can never loop.
+    assert not al._trailing_intent_retry_needed(
+        round_text="Let me create them:",
+        tools_sent_count=59,
+        tool_calls_this_turn=0,
+        retry_used=True,
+    )
+
+
+def test_retry_blocked_without_tools_sent():
+    # Narration-only is legitimate when no tools were offered.
+    assert not al._trailing_intent_retry_needed(
+        round_text="Let me create them:",
+        tools_sent_count=0,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_retry_blocked_after_tool_calls_in_turn():
+    # Post-tool summaries ("Here are your emails:") end with a colon too —
+    # zero tool calls for the WHOLE turn is what makes the colon suspicious.
+    assert not al._trailing_intent_retry_needed(
+        round_text="Here are your emails:",
+        tools_sent_count=25,
+        tool_calls_this_turn=2,
+        retry_used=False,
+    )
+
+
+def test_retry_blocked_on_substantive_answer():
+    # Long text, fenced content, or plain answers are not dangling intents.
+    assert not al._trailing_intent_retry_needed(
+        round_text="Sure! " + "x" * 500 + ":",
+        tools_sent_count=25,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+    assert not al._trailing_intent_retry_needed(
+        round_text="Here is the script:\n```python\nprint(1)\n```",
+        tools_sent_count=25,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+    assert not al._trailing_intent_retry_needed(
+        round_text="The answer is 42.",
+        tools_sent_count=25,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_retry_blocked_on_empty_text():
+    assert not al._trailing_intent_retry_needed(
+        round_text="   ",
+        tools_sent_count=25,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+# ── pure function: browser-tool prune ────────────────────────────────────
+
+_BROWSER_MIX = {
+    "bash", "read_file", "todowrite",
+    "mcp__builtin_browser__browser_navigate",
+    "mcp__builtin_browser__browser_click",
+    "mcp__builtin_browser__browser_snapshot",
+    "builtin_browser",
+}
+
+
+def test_prune_drops_browser_tools_on_plain_workspace_turn():
+    # "fill"/"submit" alone trip the ROUTE layer's loose browser-intent
+    # regex (that is how 30 Playwright tools got forced), but this prune
+    # must keep them only for real browser wording.
+    dropped = al._prune_browser_tools_for_workspace_turn(
+        _BROWSER_MIX, "create six tasks, fill in priorities and submit"
+    )
+    assert dropped == {
+        "mcp__builtin_browser__browser_navigate",
+        "mcp__builtin_browser__browser_click",
+        "mcp__builtin_browser__browser_snapshot",
+        "builtin_browser",
+    }
+
+
+def test_prune_keeps_browser_tools_on_real_browser_wording():
+    for text in (
+        "clone the repo, then open the site and click the login button",
+        "use the browser to fill out the form",
+        "take a screenshot of the page",
+        "scrape the listings with playwright",
+    ):
+        assert al._prune_browser_tools_for_workspace_turn(_BROWSER_MIX, text) == set()
+
+
+def test_prune_handles_empty_tools():
+    assert al._prune_browser_tools_for_workspace_turn(None, "anything") == set()
+    assert al._prune_browser_tools_for_workspace_turn(set(), "") == set()
+
+
+# ── replay-style integration through the real loop ───────────────────────
+
+def _collect(gen):
+    async def _run():
+        return [c async for c in gen]
+    return asyncio.run(_run())
+
+
+def _types(chunks):
+    out = []
+    for c in chunks:
+        if c.startswith("data: ") and not c.startswith("data: [DONE]"):
+            try:
+                out.append(json.loads(c[6:]))
+            except Exception:
+                pass
+    return out
+
+
+def _patch_common(monkeypatch):
+    monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
+
+    async def _fake_exec(block, *a, **k):
+        return (block.tool_type, {"output": "ok", "exit_code": 0})
+    monkeypatch.setattr(al, "execute_tool_block", _fake_exec, raising=False)
+
+
+def _run_loop(monkeypatch, round_texts, max_rounds=6, **extra):
+    """Round items are consumed in order; the last one repeats if needed.
+
+    A str item is streamed as a text delta; a dict item is streamed as a
+    native tool_calls chunk (the structured channel an API-model route
+    uses — fenced blocks are skipped for those routes).
+    """
+    state = {"n": 0}
+
+    async def _fake_stream(_candidates, messages, **kwargs):
+        i = min(state["n"], len(round_texts) - 1)
+        state["n"] += 1
+        item = round_texts[i]
+        if isinstance(item, dict):
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": item["calls"]})}\n\n'
+        else:
+            yield f'data: {json.dumps({"delta": item})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
+
+    gen = al.stream_agent_loop(
+        "http://x/v1", "qwen3.5:9b",
+        [{"role": "user", "content": "create six todo tasks"}],
+        max_rounds=max_rounds,
+        relevant_tools={"bash", "todowrite"},
+        **extra,
+    )
+    return _types(_collect(gen))
+
+
+_RECOVERED_CALL = {
+    "calls": [{
+        "name": "update_plan",
+        "arguments": json.dumps({"plan": "- [ ] tasks created"}),
+    }],
+}
+
+
+def test_recovery_narration_then_tool_call_then_done(monkeypatch):
+    """The incident replayed: narration-only round -> guard fires -> the
+    re-roll makes the tool call -> turn completes with real work done."""
+    _patch_common(monkeypatch)
+    events = _run_loop(
+        monkeypatch,
+        [
+            "Let me create them:",          # round 1: dropped call
+            _RECOVERED_CALL,                # round 2: recovered call
+            "Done — created all six tasks.",  # round 3: final answer
+        ],
+    )
+    retries = [e for e in events if e.get("type") == "trailing_intent_retry"]
+    assert len(retries) == 1, events
+    assert retries[0]["round"] == 1
+    # The recovered round actually executed a tool.
+    assert any(e.get("type") == "tool_start" for e in events), events
+    # Turn finished normally — no guards tripping at the end.
+    assert not any(e.get("type") == "rounds_exhausted" for e in events), events
+    assert not any(e.get("type") == "intent_nudge_exhausted" for e in events), events
+
+
+def test_guard_caps_at_one_retry(monkeypatch):
+    """If the re-roll also fails, the turn ends — the guard cannot loop."""
+    _patch_common(monkeypatch)
+    events = _run_loop(monkeypatch, ["Let me create them:"] * 5, max_rounds=8)
+    retries = [e for e in events if e.get("type") == "trailing_intent_retry"]
+    assert len(retries) == 1, events
+
+
+def test_post_tool_summary_never_triggers_guard(monkeypatch):
+    """Round 2 summary ending in ':' after real tool work is legitimate."""
+    _patch_common(monkeypatch)
+    events = _run_loop(
+        monkeypatch,
+        [
+            _RECOVERED_CALL,
+            "Here are your emails:",
+        ],
+    )
+    assert not any(e.get("type") == "trailing_intent_retry" for e in events), events
+    assert any(e.get("type") == "tool_start" for e in events), events
+
+
+def test_no_tools_sent_never_triggers_guard(monkeypatch):
+    """guide_only turns ship no tool schemas — narration-only is correct."""
+    from src.tool_policy import ToolPolicy
+    _patch_common(monkeypatch)
+    events = _run_loop(
+        monkeypatch,
+        ["Let me create them:"],
+        tool_policy=ToolPolicy(mode="guide_only"),
+    )
+    assert not any(e.get("type") == "trailing_intent_retry" for e in events), events
+
+
+def test_guard_skipped_when_nudge_system_message_present(monkeypatch):
+    """The guard's own retry round must not re-trigger on its output shape:
+    after the retry the turn has no tool calls yet, but retry_used blocks
+    a second fire even if the text still dangles."""
+    _patch_common(monkeypatch)
+    events = _run_loop(
+        monkeypatch,
+        ["Let me create them:", "Let me create them:", "Done."],
+        max_rounds=4,
+    )
+    retries = [e for e in events if e.get("type") == "trailing_intent_retry"]
+    assert len(retries) == 1, events
