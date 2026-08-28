@@ -5,11 +5,12 @@ Manages connections to MCP (Model Context Protocol) tool servers.
 Each server exposes tools that are made available to the agent loop.
 """
 
+import base64
 import json
 import logging
 import os
 import re
-import asyncio 
+import asyncio
 from typing import Any, Dict, List, Optional, Set, Tuple
 from src.database import McpServer, SessionLocal
 
@@ -94,6 +95,173 @@ def _format_mcp_params(input_schema: Any) -> str:
     return hint
 
 
+# --- MCP tool-result content extraction -------------------------------------
+#
+# Some MCP servers (notably the official GitHub MCP server's get_file_contents)
+# return the payload the model actually needs as an EMBEDDED RESOURCE content
+# block: {"type": "resource", "resource": {uri, mimeType, text|blob}}, next to a
+# one-line text summary ("successfully downloaded text file (SHA: …)"). The
+# SDK's EmbeddedResource has no top-level `.text`/`.data` attribute, so the old
+# renderer silently dropped it and the model only ever saw the summary (issue:
+# model "blind" to file contents). Extract resource payloads into the tool
+# stdout, capped so one huge file cannot blow the context window.
+
+# Cap for a single embedded-resource / decoded-file payload delivered to the
+# model. ~24k chars ≈ 6k tokens — big enough for real source files, small
+# enough to leave room for the rest of the round.
+_MCP_RESOURCE_TEXT_MAX = 24000
+
+# Legacy file-payload shape guard: a single text block that is exactly a JSON
+# file object (GitHub MCP pre-resource versions) whose keys are all standard
+# GitHub contents-API fields.
+_FILE_JSON_ALLOWED_KEYS = {"content", "encoding", "name", "path", "sha", "size", "type", "url"}
+
+
+def _cap_payload_text(text: str, limit: int, what: str) -> str:
+    """Cap a decoded payload, appending a visible truncation notice."""
+    if len(text) <= limit:
+        return text
+    logger.info(
+        "[mcp] %s truncated: showing first %d of %d characters", what, limit, len(text)
+    )
+    return (
+        text[:limit]
+        + f"\n\n[…truncated: showing first {limit} of {len(text)} characters. "
+        "Re-request a narrower path or range if you need the rest.]"
+    )
+
+
+def _render_resource_block(resource: Any, tool_name: str) -> Optional[str]:
+    """Render an MCP embedded resource (TextResourceContents or
+    BlobResourceContents) into a model-visible text block. Returns None when
+    there is nothing renderable (caller skips the block)."""
+    if resource is None:
+        return None
+    # pydantic AnyUrl → str (older/newer SDKs differ); mimeType likewise
+    uri = str(getattr(resource, "uri", "") or "")
+    mime = str(getattr(resource, "mimeType", "") or "")
+    name = uri.rstrip("/").rsplit("/", 1)[-1] if uri else "resource"
+
+    text = getattr(resource, "text", None)
+    if text is None:
+        blob = getattr(resource, "blob", None)
+        if not (isinstance(blob, str) and blob):
+            return None
+        try:
+            text = base64.b64decode(blob, validate=True).decode("utf-8")
+        except Exception:
+            return f"[binary resource: {name} ({mime or 'unknown type'}) — {len(blob)} base64 chars, not decodable as text]"
+        if not text:
+            return None
+
+    if not isinstance(text, str) or not text:
+        return None
+    body = _cap_payload_text(text, _MCP_RESOURCE_TEXT_MAX, f"resource {name} (tool {tool_name})")
+    header = f"[resource: {name} ({mime})]" if mime else f"[resource: {name}]"
+    return f"{header}\n{body}"
+
+
+def _unwrap_file_json_payload(text: Any) -> Optional[str]:
+    """Legacy GitHub MCP shape: get_file_contents returning a single text block
+    that IS a JSON-encoded contents-API file object with the payload under
+    'content' (base64). Decode it so the model sees the file. Returns None when
+    the text is not that shape (caller keeps the original text)."""
+    if not isinstance(text, str) or len(text) < 2 or not text.lstrip().startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or "content" not in obj:
+        return None
+    if not set(obj.keys()) <= _FILE_JSON_ALLOWED_KEYS:
+        return None
+    if obj.get("type") not in (None, "file"):
+        return None  # directory listings and search results pass through
+    payload = obj.get("content")
+    if not isinstance(payload, str) or not payload:
+        return None
+    if obj.get("encoding") == "base64":
+        try:
+            payload = base64.b64decode(payload, validate=True).decode("utf-8")
+        except Exception:
+            return None
+    name = obj.get("name") or obj.get("path") or "file"
+    body = _cap_payload_text(payload, _MCP_RESOURCE_TEXT_MAX, f"file {name}")
+    return f"[file: {name}]\n{body}"
+
+
+# --- MCP argument coercion ---------------------------------------------------
+#
+# Models routinely emit JSON tool arguments with booleans/numbers as strings
+# ("False", "true", "3"). Strict servers — the official GitHub MCP server
+# rejects the whole call with `parameter minimal_output is not of type bool, is
+# string` — so coerce against the tool's declared schema before dispatch.
+
+def _coerce_scalar(value: Any, ptype: str) -> Any:
+    if ptype == "boolean" and isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "false"):
+            return low == "true"
+        return value
+    if ptype in ("number", "integer") and isinstance(value, str) and value.strip():
+        s = value.strip()
+        try:
+            return float(s) if ptype == "number" else int(s)
+        except ValueError:
+            try:
+                f = float(s)  # "3.0" for an integer param
+                return int(f) if ptype == "integer" and f.is_integer() else f
+            except ValueError:
+                return value
+    return value
+
+
+def _coerce_value(value: Any, ptype: Any, pinfo: Any) -> Any:
+    if isinstance(ptype, list):
+        ptype = next((t for t in ptype if t != "null"), None)
+    if ptype in ("boolean", "number", "integer"):
+        return _coerce_scalar(value, ptype)
+    if isinstance(value, dict):
+        props = pinfo.get("properties") if isinstance(pinfo, dict) else None
+        props = props if isinstance(props, dict) else {}
+        out = {}
+        for k, v in value.items():
+            sub = props.get(k)
+            sub = sub if isinstance(sub, dict) else {}
+            out[k] = _coerce_value(v, sub.get("type"), sub)
+        return out
+    if isinstance(value, list):
+        items = pinfo.get("items") if isinstance(pinfo, dict) else None
+        items = items if isinstance(items, dict) else {}
+        return [_coerce_value(v, items.get("type"), items) for v in value]
+    return value
+
+
+def _coerce_args_to_schema(arguments: Dict, schema: Any, qualified_name: str = "") -> Dict:
+    """Coerce tool-call arguments to the types the tool's input schema declares
+    (bool/number strings → real types), recursing into object properties and
+    array items. Untouched for tools without a schema. Only type mismatches are
+    logged — never argument values (they can carry secrets)."""
+    if not isinstance(arguments, dict) or not isinstance(schema, dict):
+        return arguments
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return arguments
+    out = {}
+    for k, v in arguments.items():
+        pinfo = props.get(k)
+        pinfo = pinfo if isinstance(pinfo, dict) else {}
+        nv = _coerce_value(v, pinfo.get("type"), pinfo)
+        if type(nv) is not type(v):
+            logger.info(
+                "[mcp] coerced arg '%s' for %s: %s -> %s",
+                k, qualified_name or "tool", type(v).__name__, type(nv).__name__,
+            )
+        out[k] = nv
+    return out
+
+
 # Tool-name prefixes that denote a read-only/inspection operation. Used to
 # classify MCP tools for plan mode when the server provides no readOnlyHint.
 # These are PREFIXES, not whole words (matched via str.startswith below), so a
@@ -102,6 +270,23 @@ _MCP_READONLY_VERBS = (
     "list", "get", "read", "search", "fetch", "query", "find", "describe",
     "show", "view", "lookup", "count", "status", "info", "inspect", "summar",
 )
+
+
+# Compact usage guidance injected under a server's tool list, keyed by a
+# lowercase token of the server's configured name. Keeps the model from
+# mis-using tools it can't see the results of (e.g. reading files via a
+# discovery-only tool, or passing "true" strings as booleans).
+_MCP_SERVER_USAGE_NOTES = {
+    "github": "\n".join([
+        "  Usage notes:",
+        "  - Read a file: get_file_contents with {owner, repo, path, ref} — its output IS the file text (after a one-line 'successfully downloaded (SHA…)' summary; payloads over ~24k chars are truncated with a notice).",
+        "  - List a directory / repo structure: get_file_contents with path set to a directory (\"/\" = repo root) — returns entry names, types, sizes.",
+        "  - search_repositories is ONLY for discovering/listing repos by query; it never returns file contents. Do not use zread for arbitrary repos.",
+        "  - search_code locates code by pattern inside a repo/org.",
+        "  - list_branches / list_commits / list_tags / get_commit / list_releases give history and release metadata.",
+        "  - Arguments must be real JSON types: booleans true/false (never \"true\"), numbers unquoted (never \"3\").",
+    ]),
+}
 
 
 def mcp_tool_is_readonly(tool: Dict) -> bool:
@@ -480,6 +665,16 @@ class McpManager:
         if not session:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
 
+        # Coerce string-typed booleans/numbers to the schema's declared types
+        # before dispatch — strict servers (official GitHub MCP) reject the
+        # whole call otherwise ("parameter X is not of type bool, is string").
+        for tool in self._tools.get(server_id) or []:
+            if tool.get("name") == tool_name:
+                arguments = _coerce_args_to_schema(
+                    arguments, tool.get("input_schema"), qualified_name=qualified_name
+                )
+                break
+
         try:
             result = await self._do_call(session, tool_name, arguments)
         except Exception as e:
@@ -512,9 +707,20 @@ class McpManager:
         output_parts = []
         images = []
         for content in result.content:
-            if hasattr(content, 'text'):
-                output_parts.append(content.text)
-            elif getattr(content, 'type', '') == 'image' and hasattr(content, 'data'):
+            ctype = getattr(content, 'type', '')
+            # Embedded resource blocks carry the actual payload (file text,
+            # base64 blobs) — e.g. GitHub get_file_contents. Without this the
+            # model only sees the server's one-line "successfully downloaded"
+            # summary and is blind to the contents.
+            if ctype == 'resource' or hasattr(content, 'resource'):
+                block = _render_resource_block(getattr(content, 'resource', None), tool_name)
+                if block:
+                    output_parts.append(block)
+            elif hasattr(content, 'text'):
+                text = content.text
+                unwrapped = _unwrap_file_json_payload(text)
+                output_parts.append(unwrapped if unwrapped is not None else text)
+            elif ctype == 'image' and hasattr(content, 'data'):
                 # Image content (e.g. Playwright screenshots)
                 mime = getattr(content, 'mimeType', 'image/png')
                 images.append({"data": content.data, "mimeType": mime})
@@ -702,6 +908,13 @@ class McpManager:
                 # alone (issue #2509).
                 args_hint = _format_mcp_params(t.get("input_schema"))
                 lines.append(f"  - {t['qualified_name']}: {desc}{args_hint}")
+            # Per-server usage guidance (e.g. GitHub: get_file_contents output
+            # IS the file text) for servers whose name matches a known token.
+            lowered = server_name.lower()
+            for token, note in _MCP_SERVER_USAGE_NOTES.items():
+                if token in lowered:
+                    lines.append(note)
+                    break
 
         result = "\n".join(lines)
         self._cached_prompt_desc = result
