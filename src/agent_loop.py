@@ -1430,6 +1430,60 @@ def _trailing_intent_retry_needed(
     return ends_with_colon or bool(_TRAILING_INTENT_VERB_RE.search(text))
 
 
+def _cliff_continue_needed(
+    round_text: str,
+    tool_calls_this_turn: int,
+    retry_used: bool,
+    min_chars: int = 200,
+    max_chars: int = 2000,
+) -> bool:
+    """Whether a naturally-finished 0-tool round looks CUT OFF mid-word.
+
+    The 2026-08-28 "Flavi" class: qwen3.5:9b sampled EOS at token 126
+    mid-word (565 chars delivered; Ollama, proxy and app all reported
+    success). An answer of ordinary length whose last character is
+    alphanumeric — no sentence punctuation, no closing fence/quote/bracket —
+    was almost certainly truncated by a spurious EOS, not finished on
+    purpose. Punctuation-tail gating alone would false-flag ~18/129 legit
+    stored answers (quotes/parens/colons can be legitimate endings), so the
+    gate is strictly the mid-word tail: last char matches /[A-Za-z0-9]$/,
+    which by construction excludes terminal punctuation, fence closes and
+    code-block tails.
+
+    Fires only when ALL hold:
+      (a) ZERO tool calls in the entire turn so far — post-tool summaries
+          are exempt;
+      (b) the (think-stripped) round text is within [min_chars, max_chars] —
+          short texts are one-liners, very long ones are deliberate essays;
+      (c) the tail is mid-word (see above);
+      (d) the cliff retry has not been used this turn (hard cap 1 — the
+          guard can never loop).
+
+    Measured against the stored corpus (2026-08-28): 7/103 long answers end
+    on a bare lowercase word ("…it is not") — an accepted ~6% false-positive
+    rate; the caller's merge policy bounds the damage (a capitalised
+    continuation joins as a new paragraph instead of splicing mid-word).
+    CJK is deliberately NOT matched: Chinese/Japanese regularly end
+    sentences without punctuation, so a letter tail there is not evidence of
+    a cut. Runs on guide_only and force-answer rounds too — a cut is a cut,
+    and a forced final answer is exactly the shape worth resuming.
+
+    Kept as a pure function so the trigger conditions are unit-testable.
+    """
+    if retry_used:
+        return False
+    if tool_calls_this_turn > 0:
+        return False
+    text = str(round_text or "").strip()
+    if not text:
+        return False
+    if not (min_chars <= len(text) <= max_chars):
+        return False
+    # Base Latin + Latin-1 Supplement + Latin Extended-A/B (Italian users:
+    # "…la storia della città" cut before the accent must still heal).
+    return bool(re.search(r"[A-Za-z0-9À-ɏ]$", text))
+
+
 def _prune_browser_tools_for_workspace_turn(
     relevant_tools: Optional[Set[str]],
     turn_context_text: str,
@@ -2314,6 +2368,14 @@ def _is_odysseus_qwen_model(model: str) -> bool:
     return (model or "").lower().startswith("odysseus-qwen3")
 
 
+def _is_plain_qwen3_model(model: str) -> bool:
+    """Plain (non-finetune) Qwen3-family base models — "qwen3:14b",
+    "qwen3.5:9b", "qwen3-coder-…". The odysseus-qwen3* finetunes are a
+    separate, stricter branch (see _is_odysseus_qwen_model) and must NOT
+    match here: the finetune cap is 0.2, the plain-model cap is 0.7."""
+    return (model or "").lower().startswith("qwen3")
+
+
 def _ody_qwen_temperature_cap(temperature):
     """Force-cap odysseus-qwen3 sampling; the finetune destabilizes above 0.2.
 
@@ -2325,6 +2387,40 @@ def _ody_qwen_temperature_cap(temperature):
         return min(float(temperature if temperature is not None else 0.2), 0.2)
     except (TypeError, ValueError):
         return 0.2
+
+
+def _qwen_temperature_cap(model: str, temperature):
+    """Per-model Qwen temperature cap. Returns the value to actually send.
+
+    - odysseus-qwen3* finetunes: hard cap 0.2 (existing behavior, unchanged).
+    - plain qwen3*/qwen3.5* base models: cap 0.7. Qwen3 vendor guidance is
+      0.6-0.7; at 1.0 the sampler gets loose enough to emit spurious EOS
+      mid-word (2026-08-28 "Flavi" incident: qwen3.5:9b sampled EOS at token
+      126 with every layer reporting success). Lower requests pass through.
+    - anything else: caller's temperature, untouched.
+    """
+    if _is_odysseus_qwen_model(model):
+        return _ody_qwen_temperature_cap(temperature)
+    if _is_plain_qwen3_model(model):
+        try:
+            return min(float(temperature if temperature is not None else 0.7), 0.7)
+        except (TypeError, ValueError):
+            return 0.7
+    return temperature
+
+
+def _apply_qwen_temperature_cap(model: str, requested_temperature):
+    """_qwen_temperature_cap + a one-line log when the cap actually changed
+    the outgoing value, so live capping is countable in server logs."""
+    capped = _qwen_temperature_cap(model, requested_temperature)
+    if capped != requested_temperature:
+        logger.info(
+            "[agent-guard] qwen_temperature_cap model=%s requested=%s capped=%s",
+            model,
+            requested_temperature,
+            capped,
+        )
+    return capped
 
 
 def _build_system_prompt(
@@ -3654,10 +3750,12 @@ async def stream_agent_loop(
     # The caller's temperature survives for non-qwen routes; the qwen cap is
     # applied per candidate (here for the primary, in the candidate request
     # factories for fallbacks), so neither direction of a mixed qwen/non-qwen
-    # fallback chain inherits the other's value.
+    # fallback chain inherits the other's value. Finetunes cap at 0.2; plain
+    # qwen3/qwen3.5 base models cap at 0.7 (vendor guidance — see
+    # _qwen_temperature_cap).
     _requested_temperature = temperature
-    if _ody_qwen_finetune_model:
-        temperature = _ody_qwen_temperature_cap(temperature)
+    if _ody_qwen_finetune_model or _is_plain_qwen3_model(model):
+        temperature = _apply_qwen_temperature_cap(model, temperature)
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
     _low_signal_turn = bool(_intent.get("low_signal"))
@@ -3757,10 +3855,8 @@ async def stream_agent_loop(
             return {
                 "messages": candidate_messages,
                 "kwargs": {
-                    "temperature": (
-                        _ody_qwen_temperature_cap(_requested_temperature)
-                        if candidate_is_qwen
-                        else _requested_temperature
+                    "temperature": _apply_qwen_temperature_cap(
+                        candidate_model, _requested_temperature
                     ),
                 },
             }
@@ -4631,6 +4727,15 @@ async def stream_agent_loop(
     # recovery retry per turn when a 0-tool round ends on about-to-act
     # narration (Ollama silently dropped a malformed native tool call).
     _trailing_intent_retry_used = False
+    # Mid-word cliff continuation guard (2026-08-28 "Flavi" EOS class): one
+    # continuation round per turn when a naturally-stopped 0-tool answer of
+    # ordinary length ends mid-word (spurious EOS sampled by the model).
+    # Cap is independent of the guards above — at most one of each per turn.
+    _cliff_continue_used = False
+    # round_texts index of a cut round whose continuation should be spliced
+    # back into the SAME entry (history reload renders one seamless bubble
+    # instead of two with a mid-word seam). None when not continuing.
+    _cliff_merge_index = None
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -4957,6 +5062,11 @@ async def stream_agent_loop(
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
+        # Set when the round's stream ended via deadline cut or a mid-stream
+        # soft error instead of the provider's natural stop — such rounds are
+        # NOT eligible for the mid-word cliff continuation (different failure
+        # class; a continuation cannot heal a transport cut).
+        _round_stream_cut = False
 
         _active_route_state = {
             "messages": messages,
@@ -5044,10 +5154,8 @@ async def stream_agent_loop(
                 "kwargs": {
                     "tools": candidate_tools or None,
                     "tool_choice_none": state["ody_doc_finetune_mode"],
-                    "temperature": (
-                        _ody_qwen_temperature_cap(_requested_temperature)
-                        if _is_odysseus_qwen_model(candidate_model)
-                        else _requested_temperature
+                    "temperature": _apply_qwen_temperature_cap(
+                        candidate_model, _requested_temperature
                     ),
                 },
             }
@@ -5156,6 +5264,7 @@ async def stream_agent_loop(
                     time.time() - _round_start,
                     max(agent_stream_timeout * 4, 1200),
                 )
+                _round_stream_cut = True
                 break
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
@@ -5402,6 +5511,7 @@ async def stream_agent_loop(
                     elif data.get("error"):
                         err_msg = data.get("error", "unknown")
                         logger.error(f"Agent round {round_num}: stream error: {err_msg}")
+                        _round_stream_cut = True
                         yield f'data: {json.dumps({"delta": chr(10) + chr(10) + "*[Stream error: " + str(err_msg) + "]*"})}\n\n'
                 except json.JSONDecodeError:
                     if round_num == 1:
@@ -5607,10 +5717,34 @@ async def stream_agent_loop(
         # persisted text either — otherwise it streams once and then disappears
         # on reload (#3222 follow-up).
         cleaned_round = strip_tool_blocks(round_response, skip_fenced=(_is_api_model and not used_native and not guide_only)).strip()
-        round_texts.append(cleaned_round)
-        round_models.append(_round_actual_model)
-        round_endpoint_ids.append(_round_actual_endpoint_id)
-        round_endpoint_labels.append(_round_actual_endpoint_label)
+        if _cliff_merge_index is not None and _cliff_merge_index < len(round_texts):
+            # Continuation round after a mid-word cliff cut. Shape-aware
+            # merge, so a false-positive trigger (a complete answer that
+            # merely ends on a bare word — ~7/103 measured) can never mangle
+            # the text:
+            #   - continuation resumes LOWERCASE (a true mid-word resume,
+            #     "o Moretti …") → splice with NO separator at the exact
+            #     cut character;
+            #   - continuation starts capitalized or otherwise looks like a
+            #     fresh sentence → join as a new paragraph. The merged entry
+            # keeps the cut round's model/endpoint provenance. Think blocks
+            # from the continuation are stripped — the partial's think
+            # already sits at the front of the entry where the renderer
+            # expects it, and a second one mid-text would render literally.
+            _cont = _strip_think_blocks(cleaned_round)
+            _probe = _cont.lstrip()
+            if _probe[:1].islower():
+                round_texts[_cliff_merge_index] = round_texts[_cliff_merge_index] + _cont
+            else:
+                round_texts[_cliff_merge_index] = (
+                    round_texts[_cliff_merge_index].rstrip() + "\n\n" + _probe.strip()
+                )
+            _cliff_merge_index = None
+        else:
+            round_texts.append(cleaned_round)
+            round_models.append(_round_actual_model)
+            round_endpoint_ids.append(_round_actual_endpoint_id)
+            round_endpoint_labels.append(_round_actual_endpoint_label)
         if _ody_qwen_finetune_model and not tool_blocks and cleaned_round:
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
@@ -5770,6 +5904,54 @@ async def stream_agent_loop(
                     + "\n\n"
                 )
                 break
+            # ── Mid-word cliff continuation guard ──────────────────────
+            # Healer for the 2026-08-28 "Flavi" class (and any future cause
+            # of a clean-looking truncation): the round stopped naturally
+            # (provider finish, no error, no deadline cut), zero tool calls
+            # all turn, ordinary answer length, and the text ends MID-WORD —
+            # the model sampled a spurious EOS. Feed the partial back as an
+            # assistant prefix and run ONE continuation round. Cap is
+            # independent of trailing_intent_retry (at most one of each per
+            # turn); rounds that carried a (dropped) native tool-call attempt
+            # are excluded — that is the trailing-intent class, not a text
+            # cut. Never fires on the last allowed round: the continuation
+            # must actually be runnable (a promised-but-impossible retry
+            # would just collide with rounds_exhausted).
+            _cliff_text = _strip_think_blocks(cleaned_round).strip()
+            if (
+                round_num < max_rounds
+                and not _round_stream_cut
+                and not native_tool_calls
+                and _cliff_continue_needed(
+                    round_text=_cliff_text,
+                    tool_calls_this_turn=len(tool_events),
+                    retry_used=_cliff_continue_used,
+                )
+            ):
+                _cliff_continue_used = True
+                logger.warning(
+                    "[agent-guard] cliff_continue_retry session=%s round=%s "
+                    "chars=%s tail=%r",
+                    session_id or "-",
+                    round_num,
+                    len(_cliff_text),
+                    _cliff_text[-40:],
+                )
+                _cliff_merge_index = len(round_texts) - 1
+                messages.append({"role": "assistant", "content": _cliff_text})
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous answer was cut off mid-word mid-generation "
+                        "(generation ended prematurely). Continue EXACTLY where "
+                        "you stopped — do not repeat any text, do not restart "
+                        "the answer, do not apologize. Resume the sentence "
+                        "directly from the next word."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "cliff_continue_retry", "round": round_num, "chars": len(_cliff_text)})}\n\n'
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
             break  # no tools — done
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
