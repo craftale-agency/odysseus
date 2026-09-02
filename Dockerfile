@@ -69,6 +69,17 @@ RUN ARCH="$(dpkg --print-architecture)" \
     && install -m 0755 /tmp/docker/docker /usr/local/bin/docker \
     && rm -rf /tmp/docker /tmp/docker.tgz
 
+# GitHub CLI — read-mostly GitHub access for the agent (issues/PRs are NOT in
+# the github-readonly MCP preset). Pinned tarball install; auth is NOT baked in:
+# the token lives at /app/data/gh-token.txt (volume) and callers wrap it as
+# GH_TOKEN=$(cat /app/data/gh-token.txt) gh ... — see the github-lookup skill.
+ARG GH_CLI_VERSION=2.99.0
+RUN curl -fsSL https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz \
+    -o /tmp/gh.tgz \
+    && tar -xzf /tmp/gh.tgz -C /tmp \
+    && install -m 0755 /tmp/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh*
+
 WORKDIR /app
 
 # Install Python deps first (layer cache). Optional extras (PyMuPDF AGPL, etc.)
