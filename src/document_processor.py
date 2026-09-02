@@ -524,6 +524,19 @@ def build_user_content(
                                 intro_text=pdf_body_text,
                             )
                             if doc_id:
+                                if doc_id and truncated_marker:
+                                    # 2026-09-02 "35 pages" class: the plain marker dead-ends at
+                                    # "document viewer" (a human-only affordance), so the model never
+                                    # learns the full text is page-able. Mirror the Office path: name
+                                    # the doc and the read+offset tool so it can page through.
+                                    truncated_marker = (
+                                        f"\n[…truncated for inline context — full "
+                                        f"{len((pdf_body_text or '').strip()):,} chars "
+                                        f"saved as document `{doc_id}`. Use "
+                                        f"`manage_documents` with action=read, "
+                                        f"document_id={doc_id}, offset=<N> to page "
+                                        f"through.]"
+                                    )
                                 extracted_text = (
                                     f"\n\n[Form attached: {title} — {len(fields)} fields. "
                                     f"Opened in editor — edit the values there and use "
@@ -541,6 +554,19 @@ def build_user_content(
                                 body_text=pdf_body_text,
                             )
                             if doc_id:
+                                if doc_id and truncated_marker:
+                                    # 2026-09-02 "35 pages" class: the plain marker dead-ends at
+                                    # "document viewer" (a human-only affordance), so the model never
+                                    # learns the full text is page-able. Mirror the Office path: name
+                                    # the doc and the read+offset tool so it can page through.
+                                    truncated_marker = (
+                                        f"\n[…truncated for inline context — full "
+                                        f"{len((pdf_body_text or '').strip()):,} chars "
+                                        f"saved as document `{doc_id}`. Use "
+                                        f"`manage_documents` with action=read, "
+                                        f"document_id={doc_id}, offset=<N> to page "
+                                        f"through.]"
+                                    )
                                 extracted_text = (
                                     f"\n\n[PDF attached: {title} — opened in document viewer.]"
                                 )
