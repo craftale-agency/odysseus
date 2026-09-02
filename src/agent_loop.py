@@ -1484,6 +1484,43 @@ def _cliff_continue_needed(
     return bool(re.search(r"[A-Za-z0-9À-ɏ]$", text))
 
 
+# Trailing-promise detector (2026-09-02 "wave sponsor" class): the round
+# ended with a COLON that introduces content ("here's my suggestion:") — a
+# promise the model never delivered. Distinct from the mid-word cliff (which
+# excludes post-tool rounds and punctuation tails by design): this fires on
+# the promise PHRASE immediately before the colon, which is never a legit
+# sentence ending, so it stays safe even after tool calls.
+_TRAILING_PROMISE_RE = re.compile(
+    r"(here(?:'s| is| are)|suggestion|suggest(?:ion|ed|s)?|recommend(?:ation|ed|s)?|"
+    r"such as|including|for example|e\.g\.|following|options? (?:are|is)|"
+    r"candidates? (?:are|is)|top picks?|next steps?|the (?:best|third|next|main)|"
+    r"my (?:pick|recommendation|answer)|summary|conclusion)\s*:[ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def _trailing_promise_needed(
+    round_text: str,
+    retry_used: bool,
+    min_chars: int = 60,
+) -> bool:
+    """Whether a finished no-tool round ends with a promise-colon and no payload.
+
+    Fires when the think-stripped text is substantive (>= min_chars), ends
+    with a colon, and the words right before the colon match a promise/intro
+    phrase. Bare list-colon endings ("Tags:") or ordinary sentences never
+    match the phrase regex, so precision stays high; hard cap 1 per turn.
+    Kept pure for unit tests, mirroring _cliff_continue_needed.
+    """
+    if retry_used:
+        return False
+    s = round_text.strip()
+    if len(s) < min_chars or not s.endswith(":"):
+        return False
+    tail = s[-120:]
+    return bool(_TRAILING_PROMISE_RE.search(tail))
+
+
 def _prune_browser_tools_for_workspace_turn(
     relevant_tools: Optional[Set[str]],
     turn_context_text: str,
@@ -4732,6 +4769,9 @@ async def stream_agent_loop(
     # ordinary length ends mid-word (spurious EOS sampled by the model).
     # Cap is independent of the guards above — at most one of each per turn.
     _cliff_continue_used = False
+    # Trailing-promise guard (2026-09-02 "wave sponsor" class): colon-ending
+    # answer that promised content ("here's my suggestion:") — one continuation.
+    _promise_continue_used = False
     # round_texts index of a cut round whose continuation should be spliced
     # back into the SAME entry (history reload renders one seamless bubble
     # instead of two with a mid-word seam). None when not continuing.
@@ -5950,6 +5990,48 @@ async def stream_agent_loop(
                     ),
                 })
                 yield f'data: {json.dumps({"type": "cliff_continue_retry", "round": round_num, "chars": len(_cliff_text)})}\n\n'
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+            # ── Trailing-promise continuation guard ────────────────────
+            # Healer for the 2026-09-02 "wave sponsor" class: the answer
+            # stopped right after a colon that promised content ("here's my
+            # suggestion:") — spurious EOS after the intro. Unlike the
+            # mid-word cliff this MAY fire on post-tool rounds (the wave turn
+            # had fetched a README first); the promise-phrase regex keeps it
+            # precise. One continuation per turn, sharing the cliff merge
+            # machinery so the seam disappears from history.
+            _promise_text = _strip_think_blocks(cleaned_round).strip()
+            if (
+                round_num < max_rounds
+                and not _round_stream_cut
+                and not native_tool_calls
+                and _trailing_promise_needed(
+                    round_text=_promise_text,
+                    retry_used=_promise_continue_used,
+                )
+            ):
+                _promise_continue_used = True
+                logger.warning(
+                    "[agent-guard] promise_continue_retry session=%s round=%s "
+                    "chars=%s tail=%r",
+                    session_id or "-",
+                    round_num,
+                    len(_promise_text),
+                    _promise_text[-40:],
+                )
+                _cliff_merge_index = len(round_texts) - 1
+                messages.append({"role": "assistant", "content": _promise_text})
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous message ended with a colon introducing "
+                        "content that was never delivered (generation stopped "
+                        "prematurely). Continue EXACTLY where you stopped: "
+                        "deliver the item(s) you introduced after the colon. "
+                        "Do not repeat earlier text, do not restart the answer."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "promise_continue_retry", "round": round_num, "chars": len(_promise_text)})}\n\n'
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
             break  # no tools — done
