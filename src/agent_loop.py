@@ -1362,16 +1362,24 @@ def _is_contextual_retry_continuation(messages: List[Dict], text: str) -> bool:
 # A single re-roll almost always parses, so this guard appends ONE extra
 # round with a firm nudge when the round really looks unfinished.
 _TRAILING_INTENT_VERB_RE = re.compile(
-    r"(?:let\s+me|we'?ll|we\s+will|i'?ll|i\s+will|now\s+i(?:'m| am)?|"
+    r"\b(?:let\s+me|we'?ll|we\s+will|i'?ll|i\s+will|now\s+i(?:'m| am)?|"
     r"i(?:'m| am)|going\s+to)\s+(?:now\s+)?"
-    r"(?:create|save|run|check|fetch|add|set|update|list|search|"
-    r"write|make|build|tail|read|inspect|verify|examine|grab|pull|"
-    r"view|call|trigger|launch|start|stop|kill|restart|register|"
-    r"find|query|test|send|open|close|delete|remove|install|deploy|"
-    r"analyze|investigate|conduct|dive|dig|report|explore|review|"
-    r"map|identify|locate|extract|compare|summarize|continue|"
-    r"proceed|focus)"
-    r"(?:ing)?\b",
+    r"(?:creat(?:e|ing)|sav(?:e|ing)|run(?:ning)?|check(?:ing)?|"
+    r"fetch(?:ing)?|add(?:ing)?|set(?:ting)?|updat(?:e|ing)|"
+    r"list(?:ing)?|search(?:ing)?|writ(?:e|ing)|mak(?:e|ing)|"
+    r"build(?:ing)?|tail(?:ing)?|read(?:ing)?|inspect(?:ing)?|"
+    r"verify(?:ing)?|examin(?:e|ing)|grab(?:bing)?|pull(?:ing)?|"
+    r"view(?:ing)?|call(?:ing)?|trigger(?:ing)?|launch(?:ing)?|"
+    r"start(?:ing)?|stop(?:ping)?|kill(?:ing)?|restart(?:ing)?|"
+    r"register(?:ing)?|find(?:ing)?|query(?:ing)?|test(?:ing)?|"
+    r"send(?:ing)?|open(?:ing)?|clos(?:e|ing)|delet(?:e|ing)|"
+    r"remov(?:e|ing)|install(?:ing)?|deploy(?:ing)?|"
+    r"div(?:e|ing)|analyz(?:e|ing)|investigat(?:e|ing)|"
+    r"conduct(?:ing)?|dig(?:ging)?|report(?:ing)?|explor(?:e|ing)|"
+    r"review(?:ing)?|map(?:ping)?|identify(?:ing)?|locat(?:e|ing)|"
+    r"extract(?:ing)?|compar(?:e|ing)|summariz(?:e|ing)|"
+    r"continu(?:e|ing)|proceed(?:ing)?|focus(?:ing)?)"
+    r"\b",
     re.IGNORECASE,
 )
 
@@ -1432,12 +1440,19 @@ def _trailing_intent_retry_needed(
     # invisible. Verb-phrase intent therefore matches against the tail
     # window regardless of length, while a bare dangling ':' keeps the
     # length gate (long colon endings are label/list answers, not stalls).
-    tail = text[-max_chars:] if len(text) > max_chars else text
     if "```" in text:
         # Fenced content (code/answer) means the round delivered something.
         return False
-    if len(text) <= max_chars and (text.endswith(":") or text.endswith("：")):
-        return True
+    if len(text) <= max_chars:
+        if text.endswith(":") or text.endswith("："):
+            return True
+        tail = text
+    else:
+        tail = text[-max_chars:]
+        if " " in tail:
+            # Don't start the window mid-word — a phrase straddling the
+            # boundary would be silently lost.
+            tail = tail[tail.find(" ") + 1:]
     return bool(_TRAILING_INTENT_VERB_RE.search(tail))
 
 

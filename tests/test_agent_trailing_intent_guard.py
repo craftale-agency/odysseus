@@ -357,3 +357,71 @@ def test_long_answer_early_intent_only_does_not_fire():
         tool_calls_this_turn=0,
         retry_used=False,
     )
+
+
+# ── Review follow-up (2026-09-03): honest morphology + boundary pins ─────
+# The first widening used VERB(?:ing)? which cannot spell English e-drop
+# ("diving" ≠ "dive"+"ing") — "I am diving into the code now." did NOT
+# fire while tests passed via second phrases. Stem alternations fix it.
+# The prefix group also lacked a leading \b, so i'?ll matched the "ill"
+# inside "will" — activated on long tails once the total-length cap went
+# away.
+
+def test_diving_standalone_fires():
+    # THE live sentence, alone — pins the morphology fix.
+    assert al._trailing_intent_retry_needed(
+        round_text="I am diving into the code now.",
+        tools_sent_count=22,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_will_substring_does_not_fire():
+    # Reviewer's concrete false-positive: "will trigger" must need a real
+    # subject prefix, not the "ill" inside "will".
+    assert not al._trailing_intent_retry_needed(
+        round_text="The Dokploy webhook will trigger a rebuild on push, "
+                   "so no action is needed.",
+        tools_sent_count=25,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_long_colon_ending_with_intent_tail_fires_via_regex():
+    # >400 chars ending in ".": colon branch is gated by length, but the
+    # intent verb in the closing window fires the regex path.
+    body = ("Summary of the review follows. " + "y" * 450
+            + " Next: I will analyze the failing module.")
+    assert al._trailing_intent_retry_needed(
+        round_text=body,
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_long_fenced_with_intent_tail_does_not_fire():
+    # Fence gate still suppresses long texts regardless of intent tail.
+    body = ("Here is the plan:\n```\nstep 1\nstep 2\n```\n" + "z" * 450
+            + " I will analyze it after.")
+    assert not al._trailing_intent_retry_needed(
+        round_text=body,
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_im_running_statement_is_bounded_tradeoff():
+    # "I'm running ..." fires by design (present continuous ≈ about-to);
+    # statements like "I'm running late" are the accepted cost, bounded
+    # by the cap-1 retry and the tools_sent>0 precondition.
+    assert al._trailing_intent_retry_needed(
+        round_text="I'm running late but here is the full summary you "
+                   "asked for, everything checks out.",
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
