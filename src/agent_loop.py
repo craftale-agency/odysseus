@@ -1362,12 +1362,16 @@ def _is_contextual_retry_continuation(messages: List[Dict], text: str) -> bool:
 # A single re-roll almost always parses, so this guard appends ONE extra
 # round with a firm nudge when the round really looks unfinished.
 _TRAILING_INTENT_VERB_RE = re.compile(
-    r"(?:let me|i'?ll|i will|now i(?:'m| am)?|going to)\s+"
+    r"(?:let\s+me|we'?ll|we\s+will|i'?ll|i\s+will|now\s+i(?:'m| am)?|"
+    r"i(?:'m| am)|going\s+to)\s+(?:now\s+)?"
     r"(?:create|save|run|check|fetch|add|set|update|list|search|"
     r"write|make|build|tail|read|inspect|verify|examine|grab|pull|"
     r"view|call|trigger|launch|start|stop|kill|restart|register|"
-    r"find|query|test|send|open|close|delete|remove|install|deploy)"
-    r"\b",
+    r"find|query|test|send|open|close|delete|remove|install|deploy|"
+    r"analyze|investigate|conduct|dive|dig|report|explore|review|"
+    r"map|identify|locate|extract|compare|summarize|continue|"
+    r"proceed|focus)"
+    r"(?:ing)?\b",
     re.IGNORECASE,
 )
 
@@ -1404,8 +1408,9 @@ def _trailing_intent_retry_needed(
           like "Here are your emails:" never match even though they end
           with a colon;
       (c) the final text reads as about-to-act intent: it ends with a
-          dangling ':' OR matches an intent verb phrase ("Let me create",
-          "I'll save", "going to add", ...);
+          dangling ':' OR its closing window matches an intent verb
+          phrase ("Let me create", "I'll save", "going to add", "I am
+          diving into the code now", "I will analyze ...", ...);
       (d) the retry has not been used yet this turn (hard cap 1 — the
           guard can never loop).
 
@@ -1420,14 +1425,20 @@ def _trailing_intent_retry_needed(
     text = str(round_text or "").strip()
     if not text:
         return False
-    if len(text) > max_chars:
-        # Long substantive text is an answer, not a dangling promise.
-        return False
+    # Intent must live in the FINAL window of the text, not merely anywhere
+    # in it. The 2026-09-03 stall class was 1-3k-char narrations ending on
+    # future-tense planning prose ("I will analyze the srcs directory…",
+    # "I am diving into the code now.") — a total-length cap made those
+    # invisible. Verb-phrase intent therefore matches against the tail
+    # window regardless of length, while a bare dangling ':' keeps the
+    # length gate (long colon endings are label/list answers, not stalls).
+    tail = text[-max_chars:] if len(text) > max_chars else text
     if "```" in text:
         # Fenced content (code/answer) means the round delivered something.
         return False
-    ends_with_colon = text.endswith(":") or text.endswith("：")
-    return ends_with_colon or bool(_TRAILING_INTENT_VERB_RE.search(text))
+    if len(text) <= max_chars and (text.endswith(":") or text.endswith("：")):
+        return True
+    return bool(_TRAILING_INTENT_VERB_RE.search(tail))
 
 
 def _cliff_continue_needed(

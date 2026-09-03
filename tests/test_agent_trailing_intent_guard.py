@@ -295,3 +295,65 @@ def test_guard_skipped_when_nudge_system_message_present(monkeypatch):
     )
     retries = [e for e in events if e.get("type") == "trailing_intent_retry"]
     assert len(retries) == 1, events
+
+
+# ── 2026-09-03 stall class: long future-tense narration, no colon ────────
+# Live failing texts (gemma4-thinker, EthGlobal/Wave sessions): 1-3k chars
+# of planning prose ending on "I will analyze the srcs directory…", "I am
+# diving into the code now.", "we'll focus on identifying…". The old
+# total-length cap silenced all of them; the verb list lacked
+# analyze/investigate/conduct/dive/report and the "we'll" prefix.
+
+def test_long_narration_i_will_analyze_fires():
+    body = (
+        "To perform the deep dive into how Hedera fits into the Wave "
+        "project, we need to move from general concepts to concrete code "
+        "analysis. I will examine how the AI agents process information "
+        "and issue commands, where the execution layer waits on block "
+        "confirmations, and how external services are called. " + "x" * 900
+        + " I am diving into the code now. I will analyze the srcs "
+        "directory to identify these components."
+    )
+    assert al._trailing_intent_retry_needed(
+        round_text=body,
+        tools_sent_count=22,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_well_prefix_and_identify_fires():
+    assert al._trailing_intent_retry_needed(
+        round_text="Based on our previous plan, we'll focus on identifying "
+                   "the specific decision and execution loops next.",
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_conduct_deepdive_and_report_fires():
+    assert al._trailing_intent_retry_needed(
+        round_text="I will now conduct a deep-dive into the codebase and "
+                   "report back with a map of integration points.",
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
+
+
+def test_long_answer_early_intent_only_does_not_fire():
+    # Genuine long answer that mentioned an intent early then delivered:
+    # the closing window has no intent phrase, so no re-roll.
+    body = (
+        "I will check the logs in a moment, but here is the full answer "
+        "you asked for. " + "The analysis shows consistent upward trends "
+        "across all measured services. " * 30 + "In summary, everything is "
+        "healthy and no action is needed."
+    )
+    assert not al._trailing_intent_retry_needed(
+        round_text=body,
+        tools_sent_count=10,
+        tool_calls_this_turn=0,
+        retry_used=False,
+    )
