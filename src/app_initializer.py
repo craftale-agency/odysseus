@@ -23,6 +23,7 @@ from src.research_handler import ResearchHandler
 from src.upload_handler import UploadHandler
 from src.tool_utils import set_upload_handler
 from src.search import update_search_config
+from src.storage_backend import validate_storage_backend_at_boot
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     Returns:
         Dictionary containing all initialized components
     """
+    # Fail fast on a misconfigured storage backend (ODYSSEUS_STORAGE_BACKEND=s3
+    # with missing env/boto3) — the error names exactly what is missing so it
+    # is actionable straight from the container logs. No silent local fallback.
+    validate_storage_backend_at_boot()
+
     # Create directories first
     create_directories()
 
