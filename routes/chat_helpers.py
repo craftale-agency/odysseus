@@ -19,6 +19,7 @@ from src.model_context import estimate_tokens, get_context_length
 from src.auth_helpers import effective_user
 from src.prompt_security import untrusted_context_message
 from src.attachment_refs import attachment_ref
+from src.storage_backend import is_s3_uri
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
 
 from fastapi import HTTPException
@@ -381,6 +382,14 @@ def build_uploaded_file_manifest(att_ids: list, upload_handler, owner: Optional[
             continue
 
         path = info.get("path")
+        if is_s3_uri(path):
+            # Object-stored rows have no agent-readable local path: built-in
+            # file tools (read_file etc.) only understand the filesystem.
+            # The manifest keeps the "uri" (odysseus://attachment/{id}) and
+            # the owner-checked read policy; "path": None is tolerated
+            # downstream and the attachment is still inlined by the chat
+            # preprocessing pipeline.
+            path = None
         if path:
             try:
                 inside = True

@@ -2,6 +2,7 @@
 """Document processing: PDF/OCR extraction, text file handling, image VL analysis, user content building."""
 
 import os
+import shutil
 import logging
 import mimetypes
 import base64
@@ -9,6 +10,7 @@ import tempfile
 from typing import List, Dict, Any
 
 from src.llm_core import llm_call
+from src.storage_backend import is_s3_uri, read_attachment_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,18 @@ def _process_text_file(path: str) -> str:
 
 def _process_pdf(path: str, owner: str | None = None) -> str:
     """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages."""
+    _s3_tmp_dir = None
+    if is_s3_uri(path):
+        # Compat: callers holding only a path string (e.g. the document
+        # import routes) may pass an s3:// URI; materialize it for pypdf.
+        try:
+            _data = read_attachment_bytes({"path": path})
+            _s3_tmp_dir = tempfile.mkdtemp(prefix="odysseus-s3-")
+            path = os.path.join(_s3_tmp_dir, os.path.basename(path))
+            with open(path, "wb") as _f:
+                _f.write(_data)
+        except Exception as e:
+            return f"\n\n[PDF processing failed: {str(e)}]"
     try:
         from pypdf import PdfReader
         pdf_text = ""
@@ -154,6 +168,9 @@ def _process_pdf(path: str, owner: str | None = None) -> str:
 
     except Exception as e:
         return f"\n\n[PDF processing failed: {str(e)}]"
+    finally:
+        if _s3_tmp_dir is not None:
+            shutil.rmtree(_s3_tmp_dir, ignore_errors=True)
 
 
 def _truncate_inline(text: str, limit: int = 15000) -> tuple[str, str]:
@@ -344,8 +361,15 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
         except ValueError:
             return {"text": "[No vision model configured — set one in Settings → Vision]", "model": vl_model or ""}
 
-        with open(image_path, "rb") as f:
-            img_data = base64.b64encode(f.read()).decode("utf-8")
+        # Compat path: callers may hand us a bare path string — either a local
+        # file or (when the upload row is object-stored) an s3:// URI. The
+        # storage read API dispatches on the prefix.
+        if is_s3_uri(image_path):
+            img_bytes = read_attachment_bytes({"path": image_path})
+        else:
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+        img_data = base64.b64encode(img_bytes).decode("utf-8")
 
         ext = os.path.splitext(image_path)[1].lower()
         mime_map = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".gif": "gif", ".webp": "webp"}
@@ -422,205 +446,237 @@ def build_user_content(
             continue
 
         path = upload_info.get("path")
-        if not path or not os.path.exists(path):
-            logger.warning(f"Attachment {fid} path is missing")
-            continue
-        if hasattr(upload_handler, "_inside_upload_dir") and not upload_handler._inside_upload_dir(path):
-            logger.warning(f"Attachment {fid} path is outside upload directory: {path}")
-            continue
-        if not hasattr(upload_handler, "_inside_upload_dir") and not upload_handler.inside_base_dir(path):
-            logger.warning(f"Attachment {fid} path is outside base directory: {path}")
-            continue
-
-        _, ext = os.path.splitext(path.lower())
-        mime = upload_info.get("mime") or mimetypes.guess_type(path)[0] or "application/octet-stream"
-        display_name = upload_info.get("name") or upload_info.get("original_name") or path
-
-        if upload_handler.is_image_file(display_name, mime):
+        _s3_tmp_dir: str | None = None
+        if is_s3_uri(path):
+            # Object-stored attachment (ODYSSEUS_STORAGE_BACKEND=s3 row).
+            # Containment for s3 rows means "URI in the managed bucket", and
+            # the downstream processors (PIL, pypdf, markitdown, text) need a
+            # real filesystem path — so fetch the bytes once via the storage
+            # read API and materialize them under the upload's own basename
+            # (so derived titles/upload_ids stay identical to local rows).
+            if hasattr(upload_handler, "_is_managed_key") and not upload_handler._is_managed_key(path):
+                logger.warning(f"Attachment {fid} path is outside managed storage: {path}")
+                continue
             try:
-                with open(path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                # Extensionless uploads (e.g. a pasted screenshot) have no ext,
-                # so fall back to the resolved MIME subtype rather than emitting
-                # an invalid "data:image/;base64," with an empty subtype.
-                image_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("image/") else "png")
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/{image_format};base64,{encoded_string}"},
-                })
+                _s3_bytes = read_attachment_bytes(upload_info)
             except Exception as e:
-                logger.error(f"Failed to encode image {fid}: {e}")
-                if content and content[0]["type"] == "text":
-                    content[0]["text"] += "\n\n[Image attached but could not be processed]"
-                else:
-                    content.insert(0, {"type": "text", "text": "[Image attached but could not be processed]"})
-
-        elif upload_handler.is_audio_file(display_name, mime):
+                logger.error(f"Failed to fetch attachment {fid} from object storage: {e}")
+                continue
+            _s3_tmp_dir = tempfile.mkdtemp(prefix="odysseus-s3-")
+            _local = os.path.join(_s3_tmp_dir, os.path.basename(path))
             try:
-                with open(path, "rb") as audio_file:
-                    encoded_string = base64.b64encode(audio_file.read()).decode("utf-8")
-                audio_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("audio/") else "mpeg")
-                content.append({
-                    "type": "audio",
-                    "audio": {"url": f"data:audio/{audio_format};base64,{encoded_string}"},
-                })
+                with open(_local, "wb") as _tf:
+                    _tf.write(_s3_bytes)
+                path = _local
             except Exception as e:
-                logger.error(f"Failed to encode audio {fid}: {e}")
-                if content and content[0]["type"] == "text":
-                    content[0]["text"] += "\n\n[Audio attached but could not be processed]"
-                else:
-                    content.insert(0, {"type": "text", "text": "[Audio attached but could not be processed]"})
-
-        elif upload_handler.is_document_file(display_name, mime):
-            if mime == "application/pdf":
-                extracted_text = None
-                if session_id:
-                    try:
-                        from src.pdf_forms import has_form_fields, extract_fields
-                        from src.pdf_form_doc import (
-                            save_field_sidecar,
-                            create_form_markdown_document,
-                            create_plain_pdf_document,
-                        )
-                        title = os.path.splitext(os.path.basename(display_name))[0]
-                        # Pull the PDF prose once — used as either intro_text
-                        # (form path) or the doc body (plain path).
-                        try:
-                            pdf_body_text = strip_pdf_content_marker(_process_pdf(path, owner=owner))
-                        except Exception:
-                            pdf_body_text = None
-
-                        is_form = False
-                        try:
-                            is_form = has_form_fields(path)
-                        except Exception as e:
-                            logger.warning(f"PDF form detection failed for {path}: {e}")
-
-                        # Inline the PDF body in the chat content too. Without
-                        # this, the assistant only saw the "PDF attached"
-                        # banner and had no idea what was inside — even though
-                        # the sidebar Document held the full extracted text.
-                        # Cap the inline copy so a multi-hundred-page PDF
-                        # doesn't blow the model's context; the sidebar still
-                        # carries the full body for direct reference.
-                        _MAX_INLINE_CHARS = 15000
-                        body_for_chat = (pdf_body_text or "").strip()
-                        truncated_marker = ""
-                        if body_for_chat and len(body_for_chat) > _MAX_INLINE_CHARS:
-                            body_for_chat = body_for_chat[:_MAX_INLINE_CHARS]
-                            truncated_marker = (
-                                "\n[…truncated for inline context — full text "
-                                "available in the document viewer.]"
-                            )
-
-                        if is_form:
-                            fields = extract_fields(path)
-                            save_field_sidecar(path, fields)
-                            doc_id = create_form_markdown_document(
-                                session_id=session_id,
-                                fields=fields,
-                                upload_id=os.path.basename(path),
-                                title=title,
-                                intro_text=pdf_body_text,
-                            )
-                            if doc_id:
-                                if doc_id and truncated_marker:
-                                    # 2026-09-02 "35 pages" class: the plain marker dead-ends at
-                                    # "document viewer" (a human-only affordance), so the model never
-                                    # learns the full text is page-able. Mirror the Office path: name
-                                    # the doc and the read+offset tool so it can page through.
-                                    truncated_marker = (
-                                        f"\n[…truncated for inline context — full "
-                                        f"{len((pdf_body_text or '').strip()):,} chars "
-                                        f"saved as document `{doc_id}`. Use "
-                                        f"`manage_documents` with action=read, "
-                                        f"document_id={doc_id}, offset=<N> to page "
-                                        f"through.]"
-                                    )
-                                extracted_text = (
-                                    f"\n\n[Form attached: {title} — {len(fields)} fields. "
-                                    f"Opened in editor — edit the values there and use "
-                                    f"the Export PDF button when done.]"
-                                )
-                                if body_for_chat:
-                                    extracted_text += (
-                                        f"\n\n[PDF content — {title}]:\n{body_for_chat}{truncated_marker}"
-                                    )
-                        else:
-                            doc_id = create_plain_pdf_document(
-                                session_id=session_id,
-                                upload_id=os.path.basename(path),
-                                title=title,
-                                body_text=pdf_body_text,
-                            )
-                            if doc_id:
-                                if doc_id and truncated_marker:
-                                    # 2026-09-02 "35 pages" class: the plain marker dead-ends at
-                                    # "document viewer" (a human-only affordance), so the model never
-                                    # learns the full text is page-able. Mirror the Office path: name
-                                    # the doc and the read+offset tool so it can page through.
-                                    truncated_marker = (
-                                        f"\n[…truncated for inline context — full "
-                                        f"{len((pdf_body_text or '').strip()):,} chars "
-                                        f"saved as document `{doc_id}`. Use "
-                                        f"`manage_documents` with action=read, "
-                                        f"document_id={doc_id}, offset=<N> to page "
-                                        f"through.]"
-                                    )
-                                extracted_text = (
-                                    f"\n\n[PDF attached: {title} — opened in document viewer.]"
-                                )
-                                if body_for_chat:
-                                    extracted_text += (
-                                        f"\n\n[PDF content — {title}]:\n{body_for_chat}{truncated_marker}"
-                                    )
-
-                        if doc_id and auto_opened_docs is not None:
-                            from src.database import SessionLocal, Document
-                            _db = SessionLocal()
-                            try:
-                                _d = _db.query(Document).filter(
-                                    Document.id == doc_id
-                                ).first()
-                                if _d:
-                                    auto_opened_docs.append({
-                                        "doc_id": _d.id,
-                                        "title": _d.title,
-                                        "language": _d.language,
-                                        "content": _d.current_content,
-                                        "version": _d.version_count,
-                                    })
-                            finally:
-                                _db.close()
-                    except Exception as e:
-                        logger.warning(f"PDF auto-doc creation failed for {path}: {e}")
-                if extracted_text is None:
-                    extracted_text = _process_pdf(path, owner=owner)
-            elif mime.startswith("text/") or _is_text_file(path):
-                extracted_text = _process_text_file(path)
-            else:
-                extracted_text = _process_office_document(
-                    path,
-                    display_name,
-                    session_id=session_id,
-                    auto_opened_docs=auto_opened_docs,
-                    owner=owner,
-                )
-
-            extracted_text, inline_attachment_remaining = _fit_inline_attachment_text(
-                extracted_text,
-                inline_attachment_remaining,
-                display_name,
-            )
-            if content and content[0]["type"] == "text":
-                content[0]["text"] += extracted_text
-            else:
-                content.insert(0, {"type": "text", "text": extracted_text.lstrip()})
+                shutil.rmtree(_s3_tmp_dir, ignore_errors=True)
+                logger.error(f"Failed to materialize attachment {fid}: {e}")
+                continue
         else:
-            if content and content[0]["type"] == "text":
-                content[0]["text"] += "\n\n[Attached non-text file]"
+            if not path or not os.path.exists(path):
+                logger.warning(f"Attachment {fid} path is missing")
+                continue
+            if hasattr(upload_handler, "_inside_upload_dir") and not upload_handler._inside_upload_dir(path):
+                logger.warning(f"Attachment {fid} path is outside upload directory: {path}")
+                continue
+            if not hasattr(upload_handler, "_inside_upload_dir") and not upload_handler.inside_base_dir(path):
+                logger.warning(f"Attachment {fid} path is outside base directory: {path}")
+                continue
+
+        try:
+            _, ext = os.path.splitext(path.lower())
+            mime = upload_info.get("mime") or mimetypes.guess_type(path)[0] or "application/octet-stream"
+            display_name = upload_info.get("name") or upload_info.get("original_name") or path
+
+            if upload_handler.is_image_file(display_name, mime):
+                try:
+                    with open(path, "rb") as image_file:
+                        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+                    # Extensionless uploads (e.g. a pasted screenshot) have no ext,
+                    # so fall back to the resolved MIME subtype rather than emitting
+                    # an invalid "data:image/;base64," with an empty subtype.
+                    image_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("image/") else "png")
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/{image_format};base64,{encoded_string}"},
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to encode image {fid}: {e}")
+                    if content and content[0]["type"] == "text":
+                        content[0]["text"] += "\n\n[Image attached but could not be processed]"
+                    else:
+                        content.insert(0, {"type": "text", "text": "[Image attached but could not be processed]"})
+
+            elif upload_handler.is_audio_file(display_name, mime):
+                try:
+                    with open(path, "rb") as audio_file:
+                        encoded_string = base64.b64encode(audio_file.read()).decode("utf-8")
+                    audio_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("audio/") else "mpeg")
+                    content.append({
+                        "type": "audio",
+                        "audio": {"url": f"data:audio/{audio_format};base64,{encoded_string}"},
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to encode audio {fid}: {e}")
+                    if content and content[0]["type"] == "text":
+                        content[0]["text"] += "\n\n[Audio attached but could not be processed]"
+                    else:
+                        content.insert(0, {"type": "text", "text": "[Audio attached but could not be processed]"})
+
+            elif upload_handler.is_document_file(display_name, mime):
+                if mime == "application/pdf":
+                    extracted_text = None
+                    if session_id:
+                        try:
+                            from src.pdf_forms import has_form_fields, extract_fields
+                            from src.pdf_form_doc import (
+                                save_field_sidecar,
+                                create_form_markdown_document,
+                                create_plain_pdf_document,
+                            )
+                            title = os.path.splitext(os.path.basename(display_name))[0]
+                            # Pull the PDF prose once — used as either intro_text
+                            # (form path) or the doc body (plain path).
+                            try:
+                                pdf_body_text = strip_pdf_content_marker(_process_pdf(path, owner=owner))
+                            except Exception:
+                                pdf_body_text = None
+
+                            is_form = False
+                            try:
+                                is_form = has_form_fields(path)
+                            except Exception as e:
+                                logger.warning(f"PDF form detection failed for {path}: {e}")
+
+                            # Inline the PDF body in the chat content too. Without
+                            # this, the assistant only saw the "PDF attached"
+                            # banner and had no idea what was inside — even though
+                            # the sidebar Document held the full extracted text.
+                            # Cap the inline copy so a multi-hundred-page PDF
+                            # doesn't blow the model's context; the sidebar still
+                            # carries the full body for direct reference.
+                            _MAX_INLINE_CHARS = 15000
+                            body_for_chat = (pdf_body_text or "").strip()
+                            truncated_marker = ""
+                            if body_for_chat and len(body_for_chat) > _MAX_INLINE_CHARS:
+                                body_for_chat = body_for_chat[:_MAX_INLINE_CHARS]
+                                truncated_marker = (
+                                    "\n[…truncated for inline context — full text "
+                                    "available in the document viewer.]"
+                                )
+
+                            if is_form:
+                                fields = extract_fields(path)
+                                save_field_sidecar(path, fields)
+                                doc_id = create_form_markdown_document(
+                                    session_id=session_id,
+                                    fields=fields,
+                                    upload_id=os.path.basename(path),
+                                    title=title,
+                                    intro_text=pdf_body_text,
+                                )
+                                if doc_id:
+                                    if doc_id and truncated_marker:
+                                        # 2026-09-02 "35 pages" class: the plain marker dead-ends at
+                                        # "document viewer" (a human-only affordance), so the model never
+                                        # learns the full text is page-able. Mirror the Office path: name
+                                        # the doc and the read+offset tool so it can page through.
+                                        truncated_marker = (
+                                            f"\n[…truncated for inline context — full "
+                                            f"{len((pdf_body_text or '').strip()):,} chars "
+                                            f"saved as document `{doc_id}`. Use "
+                                            f"`manage_documents` with action=read, "
+                                            f"document_id={doc_id}, offset=<N> to page "
+                                            f"through.]"
+                                        )
+                                    extracted_text = (
+                                        f"\n\n[Form attached: {title} — {len(fields)} fields. "
+                                        f"Opened in editor — edit the values there and use "
+                                        f"the Export PDF button when done.]"
+                                    )
+                                    if body_for_chat:
+                                        extracted_text += (
+                                            f"\n\n[PDF content — {title}]:\n{body_for_chat}{truncated_marker}"
+                                        )
+                            else:
+                                doc_id = create_plain_pdf_document(
+                                    session_id=session_id,
+                                    upload_id=os.path.basename(path),
+                                    title=title,
+                                    body_text=pdf_body_text,
+                                )
+                                if doc_id:
+                                    if doc_id and truncated_marker:
+                                        # 2026-09-02 "35 pages" class: the plain marker dead-ends at
+                                        # "document viewer" (a human-only affordance), so the model never
+                                        # learns the full text is page-able. Mirror the Office path: name
+                                        # the doc and the read+offset tool so it can page through.
+                                        truncated_marker = (
+                                            f"\n[…truncated for inline context — full "
+                                            f"{len((pdf_body_text or '').strip()):,} chars "
+                                            f"saved as document `{doc_id}`. Use "
+                                            f"`manage_documents` with action=read, "
+                                            f"document_id={doc_id}, offset=<N> to page "
+                                            f"through.]"
+                                        )
+                                    extracted_text = (
+                                        f"\n\n[PDF attached: {title} — opened in document viewer.]"
+                                    )
+                                    if body_for_chat:
+                                        extracted_text += (
+                                            f"\n\n[PDF content — {title}]:\n{body_for_chat}{truncated_marker}"
+                                        )
+
+                            if doc_id and auto_opened_docs is not None:
+                                from src.database import SessionLocal, Document
+                                _db = SessionLocal()
+                                try:
+                                    _d = _db.query(Document).filter(
+                                        Document.id == doc_id
+                                    ).first()
+                                    if _d:
+                                        auto_opened_docs.append({
+                                            "doc_id": _d.id,
+                                            "title": _d.title,
+                                            "language": _d.language,
+                                            "content": _d.current_content,
+                                            "version": _d.version_count,
+                                        })
+                                finally:
+                                    _db.close()
+                        except Exception as e:
+                            logger.warning(f"PDF auto-doc creation failed for {path}: {e}")
+                    if extracted_text is None:
+                        extracted_text = _process_pdf(path, owner=owner)
+                elif mime.startswith("text/") or _is_text_file(path):
+                    extracted_text = _process_text_file(path)
+                else:
+                    extracted_text = _process_office_document(
+                        path,
+                        display_name,
+                        session_id=session_id,
+                        auto_opened_docs=auto_opened_docs,
+                        owner=owner,
+                    )
+
+                extracted_text, inline_attachment_remaining = _fit_inline_attachment_text(
+                    extracted_text,
+                    inline_attachment_remaining,
+                    display_name,
+                )
+                if content and content[0]["type"] == "text":
+                    content[0]["text"] += extracted_text
+                else:
+                    content.insert(0, {"type": "text", "text": extracted_text.lstrip()})
             else:
-                content.insert(0, {"type": "text", "text": "[Attached non-text file]"})
+                if content and content[0]["type"] == "text":
+                    content[0]["text"] += "\n\n[Attached non-text file]"
+                else:
+                    content.insert(0, {"type": "text", "text": "[Attached non-text file]"})
+
+        finally:
+            if _s3_tmp_dir is not None:
+                shutil.rmtree(_s3_tmp_dir, ignore_errors=True)
 
     has_media = any(item.get("type") in ["image_url", "audio"] for item in content if isinstance(item, dict))
     if not has_media and content:

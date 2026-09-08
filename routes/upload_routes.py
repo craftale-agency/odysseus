@@ -1,4 +1,5 @@
 # routes/upload_routes.py
+import io
 import os
 import time
 import json
@@ -6,7 +7,9 @@ import asyncio
 import shutil
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import APIRouter, Request, File, UploadFile, HTTPException, Form
+from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import logging
 from core.middleware import require_admin
@@ -24,6 +27,7 @@ from core.database import (
 from src.auth_helpers import effective_user
 from src.attachment_refs import attachment_refs_from_metadata
 from src.constants import GENERATED_IMAGES_DIR
+from src.storage_backend import is_s3_uri
 from src.upload_handler import (
     UploadCleanupSafetyError,
     count_recent_uploads,
@@ -157,6 +161,39 @@ def setup_upload_routes(upload_handler):
         except Exception:
             return False
 
+    def _attachment_disposition(filename: str) -> str:
+        """Content-Disposition matching FileResponse(filename=...) semantics."""
+        quoted = quote(filename)
+        if quoted != filename:
+            return f"attachment; filename*=utf-8''{quoted}"
+        return f'attachment; filename="{filename}"'
+
+    def _image_thumbnail_response(file_id: str, load_bytes, source_mtime: float):
+        """Serve (building once, locally cached) the small JPEG thumb.
+
+        The thumbnail cache is LOCAL-ephemeral under UPLOAD_DIR/.thumbs for
+        every backend — object storage is never written on the preview path.
+        Bytes come from the storage backend via load_bytes().
+        """
+        from fastapi.responses import FileResponse
+        from PIL import Image, ImageOps
+        thumb_dir = os.path.join(_upload_root(), ".thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+        thumb_path = os.path.join(thumb_dir, file_id + ".jpg")
+        if not os.path.exists(thumb_path) or os.path.getmtime(thumb_path) < source_mtime:
+            im = Image.open(io.BytesIO(load_bytes()))
+            # iPhone / camera JPEGs encode rotation in EXIF rather than
+            # the pixel data. Browsers honour that on the original via
+            # image-orientation:from-image, but PIL strips EXIF when it
+            # saves the JPEG thumb, leaving the pixels sideways. Bake
+            # the rotation into the pixels before thumbnailing.
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((320, 320))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(thumb_path, "JPEG", quality=80)
+        return FileResponse(thumb_path, media_type="image/jpeg", headers=UPLOAD_RESPONSE_HEADERS)
+
     def _resolve_upload_path(file_id: str) -> str:
         from src.constants import UPLOAD_DIR
         upload_root = getattr(upload_handler, "upload_dir", UPLOAD_DIR)
@@ -199,7 +236,20 @@ def setup_upload_routes(upload_handler):
             return None
 
         source_path = meta.get("path")
-        if not source_path or not os.path.isfile(source_path):
+        s3_image_bytes = None
+        if is_s3_uri(source_path):
+            # Gallery images stay local (out of scope for object storage); the
+            # source bytes for an s3 chat upload are fetched once on promotion.
+            try:
+                s3 = upload_handler._s3_backend_for_row(source_path)
+                key = s3.key_for_uri(source_path) if s3 else None
+                if key is None:
+                    return None
+                s3_image_bytes = s3.get_bytes(key)
+            except Exception as e:
+                logger.warning("Failed to read chat image from object storage for gallery: %s", e)
+                return None
+        elif not source_path or not os.path.isfile(source_path):
             return None
 
         db = SessionLocal()
@@ -230,7 +280,10 @@ def setup_upload_routes(upload_handler):
                 ext = mime_ext or ".png"
             filename = f"{uuid.uuid4().hex[:12]}{ext}"
             dest_path = image_dir / filename
-            shutil.copy2(source_path, dest_path)
+            if s3_image_bytes is not None:
+                dest_path.write_bytes(s3_image_bytes)
+            else:
+                shutil.copy2(source_path, dest_path)
 
             image_id = str(uuid.uuid4())
             db.add(GalleryImage(
@@ -376,38 +429,71 @@ def setup_upload_routes(upload_handler):
                 raise HTTPException(403, "Access denied")
             if file_owner != current_user and not auth_mgr.is_admin(current_user):
                 raise HTTPException(404, "File not found")
+        info_path = (info or {}).get("path") if info else None
+        if is_s3_uri(info_path):
+            return _serve_s3_upload(info_path, info or {}, original_name, file_id, thumb)
         path = _resolve_upload_path(file_id)
         mime = (info or {}).get("mime") or _mt.guess_type(path)[0] or "application/octet-stream"
-        from fastapi.responses import FileResponse
         # Downscaled thumbnail for image previews — generated once and cached.
         if thumb and mime.startswith("image/"):
             try:
-                from PIL import Image, ImageOps
-                thumb_dir = os.path.join(_upload_root(), ".thumbs")
-                os.makedirs(thumb_dir, exist_ok=True)
-                thumb_path = os.path.join(thumb_dir, file_id + ".jpg")
-                if (not os.path.exists(thumb_path)
-                        or os.path.getmtime(thumb_path) < os.path.getmtime(path)):
-                    im = Image.open(path)
-                    # iPhone / camera JPEGs encode rotation in EXIF rather than
-                    # the pixel data. Browsers honour that on the original via
-                    # image-orientation:from-image, but PIL strips EXIF when it
-                    # saves the JPEG thumb, leaving the pixels sideways. Bake
-                    # the rotation into the pixels before thumbnailing.
-                    im = ImageOps.exif_transpose(im)
-                    im.thumbnail((320, 320))
-                    if im.mode not in ("RGB", "L"):
-                        im = im.convert("RGB")
-                    im.save(thumb_path, "JPEG", quality=80)
-                return FileResponse(thumb_path, media_type="image/jpeg", headers=UPLOAD_RESPONSE_HEADERS)
+                def _read_local(p=path):
+                    with open(p, "rb") as f:
+                        return f.read()
+                return _image_thumbnail_response(
+                    file_id,
+                    _read_local,
+                    os.path.getmtime(path),
+                )
             except Exception as e:
                 logger.warning(f"Thumbnail generation failed for {file_id}: {e}")
                 # Fall through to the full image.
+        from fastapi.responses import FileResponse
         return FileResponse(
             path,
             media_type=mime,
             filename=original_name,
             headers=UPLOAD_RESPONSE_HEADERS,
+        )
+
+    def _serve_s3_upload(
+        storage_uri: str,
+        info: dict,
+        original_name: str,
+        file_id: str,
+        thumb: int,
+    ):
+        """Serve an object-stored upload: stream bytes with the same headers,
+        filename semantics, and local-ephemeral thumbnail cache as local rows."""
+        s3 = upload_handler._s3_backend_for_row(storage_uri)
+        key = s3.key_for_uri(storage_uri) if s3 else None
+        if key is None or not upload_handler._stored_upload_present(storage_uri):
+            raise HTTPException(404, "File not found")
+        import mimetypes as _mt
+        mime = info.get("mime") or _mt.guess_type(storage_uri)[0] or "application/octet-stream"
+        if thumb and mime.startswith("image/"):
+            try:
+                stat_info = s3.stat(key) or {}
+                last_modified = stat_info.get("last_modified")
+                source_mtime = (
+                    last_modified.timestamp()
+                    if hasattr(last_modified, "timestamp")
+                    else 0.0
+                )
+                return _image_thumbnail_response(
+                    file_id,
+                    lambda: s3.get_bytes(key),
+                    source_mtime,
+                )
+            except Exception as e:
+                logger.warning(f"Thumbnail generation failed for {file_id}: {e}")
+                # Fall through to the full image.
+        headers = dict(UPLOAD_RESPONSE_HEADERS)
+        headers["Content-Disposition"] = _attachment_disposition(original_name)
+        return StreamingResponse(
+            s3.get_stream(key),
+            media_type=mime,
+            headers=headers,
         )
 
     def _load_upload_info(file_id: str):
@@ -465,7 +551,15 @@ def setup_upload_routes(upload_handler):
                 raise HTTPException(403, "Access denied")
             if file_owner != current_user and not auth_mgr.is_admin(current_user):
                 raise HTTPException(404, "File not found")
-        path = _resolve_upload_path(file_id)
+        info_path = (info or {}).get("path")
+        if is_s3_uri(info_path):
+            # Object-stored rows: pass the s3:// URI through — the vision
+            # reader handles both URI and local path forms.
+            if not upload_handler._stored_upload_present(info_path):
+                raise HTTPException(404, "File not found")
+            path = info_path
+        else:
+            path = _resolve_upload_path(file_id)
         import mimetypes as _mt
         mime = (info or {}).get("mime") or _mt.guess_type(path)[0] or ""
         if not mime.startswith("image/"):
@@ -511,7 +605,12 @@ def setup_upload_routes(upload_handler):
                 raise HTTPException(403, "Access denied")
             if file_owner != current_user and not auth_mgr.is_admin(current_user):
                 raise HTTPException(404, "File not found")
-        _resolve_upload_path(file_id)
+        info_path = (info or {}).get("path")
+        if is_s3_uri(info_path):
+            if not upload_handler._stored_upload_present(info_path):
+                raise HTTPException(404, "File not found")
+        else:
+            _resolve_upload_path(file_id)
         try:
             body = await request.json()
         except json.JSONDecodeError:
