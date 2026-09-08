@@ -49,6 +49,16 @@ services:
       - SEARXNG_INSTANCE=${SEARXNG_INSTANCE:-http://searxng:8080}
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
+      # Opt-in S3/MinIO storage offload for uploads & documents (src/storage_backend.py).
+      # local (default) keeps everything on the named volume; s3 requires the
+      # four ODYSSEUS_S3_* vars below and fails fast at boot when unset.
+      - ODYSSEUS_STORAGE_BACKEND=${ODYSSEUS_STORAGE_BACKEND:-local}
+      - ODYSSEUS_S3_ENDPOINT=${ODYSSEUS_S3_ENDPOINT:-}
+      - ODYSSEUS_S3_ACCESS_KEY=${ODYSSEUS_S3_ACCESS_KEY:-}
+      - ODYSSEUS_S3_SECRET_KEY=${ODYSSEUS_S3_SECRET_KEY:-}
+      - ODYSSEUS_S3_BUCKET=${ODYSSEUS_S3_BUCKET:-}
+      - ODYSSEUS_S3_REGION=${ODYSSEUS_S3_REGION:-us-east-1}
+      - ODYSSEUS_S3_PATH_STYLE=${ODYSSEUS_S3_PATH_STYLE:-true}
       # Comma-separated list of proxy hostnames that front an Ollama
       # OpenAI-compat /v1 endpoint (e.g. langfuse-openai-proxy via Cloudflare
       # Tunnel). When set, Odysseus forwards `think: false` to thinking models
