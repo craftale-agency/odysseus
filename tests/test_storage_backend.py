@@ -151,6 +151,17 @@ def test_s3_defaults_path_style_true_region_fallback(monkeypatch):
     assert S3Backend().path_style is False
 
 
+def test_s3_path_style_falsy_value_parsing(monkeypatch):
+    for name, value in ALL_S3_ENV.items():
+        monkeypatch.setenv(name, value)
+    for falsy in ("0", " off ", "No", "FALSE"):
+        monkeypatch.setenv(storage_backend.ENV_S3_PATH_STYLE, falsy)
+        assert S3Backend().path_style is False, falsy
+    for truthy in ("1", "true", " yes ", "ON"):
+        monkeypatch.setenv(storage_backend.ENV_S3_PATH_STYLE, truthy)
+        assert S3Backend().path_style is True, truthy
+
+
 # ---------------------------------------------------------------------------
 # Boot fail-fast matrix
 # ---------------------------------------------------------------------------
@@ -215,6 +226,27 @@ def test_boot_validation_unknown_backend_name_raises(monkeypatch):
     monkeypatch.setenv(storage_backend.ENV_STORAGE_BACKEND, "ftp")
     with pytest.raises(RuntimeError, match="ODYSSEUS_STORAGE_BACKEND"):
         validate_storage_backend_at_boot()
+
+
+def test_boot_validation_rejects_endpoint_without_scheme(monkeypatch):
+    for name, value in ALL_S3_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(ENV_S3_ENDPOINT, "minio.example.com")
+    with pytest.raises(RuntimeError, match=ENV_S3_ENDPOINT):
+        validate_storage_backend_at_boot()
+
+
+def test_boot_validation_rejects_invalid_bucket_name(monkeypatch):
+    for name, value in ALL_S3_ENV.items():
+        monkeypatch.setenv(name, value)
+    for bad in ("Upper_Case", "ab", "-leading-hyphen", "trailing.hyphen.",
+                "spaces in name", "a" * 64):
+        monkeypatch.setenv(ENV_S3_BUCKET, bad)
+        with pytest.raises(RuntimeError, match=ENV_S3_BUCKET):
+            validate_storage_backend_at_boot()
+    # Sanity: a conventional name still passes.
+    monkeypatch.setenv(ENV_S3_BUCKET, "odysseus-uploads")
+    assert validate_storage_backend_at_boot() is None
 
 
 def test_boot_validation_accepts_configured_s3(monkeypatch):

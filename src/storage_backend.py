@@ -27,6 +27,7 @@ the date-sharded ``YYYY/MM/DD/{uuid32}{ext}`` shape used by save_upload.
 """
 
 import os
+import re
 import abc
 import logging
 import mimetypes
@@ -182,15 +183,18 @@ class LocalBackend(StorageBackend):
         return _chunks()
 
     def exists(self, key: str) -> bool:
+        self._assert_inside(key)
         return os.path.isfile(key)
 
     def delete(self, key: str) -> None:
+        self._assert_inside(key)
         try:
             os.remove(key)
         except FileNotFoundError:
             pass
 
     def stat(self, key: str) -> Optional[Dict[str, Any]]:
+        self._assert_inside(key)
         try:
             st = os.stat(key)
         except OSError:
@@ -304,7 +308,19 @@ class S3Backend(StorageBackend):
 
     def get_stream(self, key: str):
         obj = self.client().get_object(Bucket=self.bucket, Key=key)
-        return obj["Body"].iter_chunks(chunk_size=65536)
+        body = obj["Body"]
+
+        def _chunks():
+            # Close the StreamingBody on ANY exit (including client
+            # disconnects mid-download) so the pooled connection is
+            # released immediately instead of waiting out the read
+            # timeout.
+            try:
+                yield from body.iter_chunks(chunk_size=65536)
+            finally:
+                body.close()
+
+        return _chunks()
 
     def exists(self, key: str) -> bool:
         from botocore.exceptions import ClientError
@@ -458,6 +474,19 @@ def validate_storage_backend_at_boot() -> None:
             "ODYSSEUS_STORAGE_BACKEND=s3 requires "
             + ", ".join(missing)
             + " to be set (non-empty). Refusing to fall back to local storage."
+        )
+    endpoint = os.getenv(ENV_S3_ENDPOINT, "").strip()
+    if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+        raise RuntimeError(
+            f"{ENV_S3_ENDPOINT} must start with http:// or https:// "
+            f"(got {endpoint!r}). Refusing to fall back to local storage."
+        )
+    bucket = os.getenv(ENV_S3_BUCKET, "").strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+        raise RuntimeError(
+            f"{ENV_S3_BUCKET} is not a valid S3 bucket name "
+            f"(3-63 chars, lowercase alphanumerics, dots and hyphens; got {bucket!r}). "
+            "Refusing to fall back to local storage."
         )
     try:
         import boto3  # noqa: F401

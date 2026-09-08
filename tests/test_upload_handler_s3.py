@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import storage_backend
-from src.storage_backend import S3Backend
+from src.storage_backend import S3Backend, is_s3_uri
 from src.upload_handler import UploadHandler
 
 BUCKET = "odysseus-test"
@@ -106,6 +107,28 @@ def _png_bytes() -> bytes:
 # ---------------------------------------------------------------------------
 # save_upload through the s3 backend
 # ---------------------------------------------------------------------------
+
+def test_save_upload_local_default_path_shape_regression_lock(tmp_path, monkeypatch):
+    """Default env (no ODYSSEUS_STORAGE_BACKEND): save_upload must keep
+    writing the historical local layout — absolute path under
+    upload_dir/YYYY/MM/DD/<id> — with no s3 URI in sight."""
+    assert storage_backend.get_storage_backend().is_s3 is False
+
+    handler = _make_handler(tmp_path)
+    content = b"plain local world"
+    meta = handler.save_upload(_fake_upload(content, "note.txt"), "127.0.0.1", owner="alice")
+
+    expected_dir = Path(handler.upload_dir)
+    # Exact historical shape: <upload_dir>/<YYYY>/<MM>/<DD>/<id>
+    rel = Path(meta["path"]).relative_to(expected_dir)
+    assert len(rel.parts) == 4
+    assert re.fullmatch(r"\d{4}", rel.parts[0])
+    assert re.fullmatch(r"\d{2}", rel.parts[1])
+    assert re.fullmatch(r"\d{2}", rel.parts[2])
+    assert rel.parts[3] == meta["id"]
+    assert not is_s3_uri(meta["path"])
+    assert Path(meta["path"]).read_bytes() == content
+
 
 def test_save_upload_writes_s3_uri_path_with_date_sharded_key(tmp_path, monkeypatch):
     handler = _make_handler(tmp_path)

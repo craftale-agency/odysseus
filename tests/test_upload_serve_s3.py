@@ -226,6 +226,26 @@ def test_download_file_s3_missing_object_404(tmp_path, monkeypatch):
     assert exc.value.status_code == 404
 
 
+def test_download_file_s3_foreign_bucket_row_404(tmp_path, monkeypatch):
+    """A row pointing at a bucket other than the configured one must 404,
+    not stream bytes from (or even probe) an unmanaged bucket."""
+    handler, fake, endpoints, _dir = _make_s3_store(tmp_path, monkeypatch)
+    alice_id = "2e" * 16 + ".png"
+    row = _add_s3_row(handler, fake, file_id=alice_id, data=_png_bytes(), owner="alice")
+    # Rewrite the row's path to a foreign bucket (same key shape).
+    row["path"] = "s3://someone-else/2026/09/08/" + alice_id
+    db = Path(handler.upload_dir) / "uploads.json"
+    index = json.loads(db.read_text(encoding="utf-8"))
+    index[f"alice:hash-{alice_id[:6]}"]["path"] = row["path"]
+    db.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            endpoints["download_file"](_Request(user="alice", auth_manager=_AuthManager()), alice_id)
+        )
+    assert exc.value.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Thumbnail cache (local-ephemeral, built from backend bytes)
 # ---------------------------------------------------------------------------

@@ -717,6 +717,16 @@ class UploadHandler:
         atomic index reduction -> byte deletion with index rollback). Local
         rows found in the index are never touched here; the local walk is
         skipped entirely while the active backend is s3.
+
+        Locking: ListObjectsV2 pagination and object deletion are network
+        round-trips, so they run OUTSIDE _index_lock; the lock is taken only
+        to read+reduce the index per object (releasing it between objects so
+        concurrent uploads/reservations are not blocked by the sweep).
+        Delete-vs-reserve atomicity is preserved by the same ordering as the
+        local path: the index row is durably removed before the bytes are
+        deleted, so a reservation racing the delete either sees the row gone
+        (fails) or refreshes last_accessed before the reduction write lands
+        (making the row recent and sparing the object).
         """
         backend = storage_backend.get_storage_backend()
         try:
@@ -728,29 +738,35 @@ class UploadHandler:
             referenced_hashes = {str(value) for value in referenced_upload_hashes}
             uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
 
-            with self._index_lock:
-                current_index = dict(self._load_upload_index(fail_on_error=True))
+            # Phase 1 (no lock): enumerate + pre-filter candidates. Reference
+            # discovery only understands canonical upload IDs; unknown objects
+            # fail closed instead of being swept.
+            candidates: list[str] = []
+            for object_key in backend.list_keys():
+                file = object_key.rsplit("/", 1)[-1]
+                if not self.validate_upload_id(file):
+                    continue
+                key_parts = object_key.split("/")
+                if len(key_parts) < 4:
+                    continue
+                try:
+                    dir_date = datetime(
+                        int(key_parts[-4]), int(key_parts[-3]), int(key_parts[-2])
+                    )
+                except (ValueError, IndexError):
+                    continue
+                if dir_date >= cutoff_date:
+                    continue
+                candidates.append(object_key)
 
-                for object_key in backend.list_keys():
-                    file = object_key.rsplit("/", 1)[-1]
-                    # Reference discovery only understands canonical upload
-                    # IDs; unknown objects fail closed instead of being swept.
-                    if not self.validate_upload_id(file):
-                        continue
+            # Phase 2: per object, mutate the index under the lock, delete
+            # the bytes outside it.
+            for object_key in candidates:
+                file = object_key.rsplit("/", 1)[-1]
+                object_uri = backend.uri_for_key(object_key)
 
-                    key_parts = object_key.split("/")
-                    if len(key_parts) < 4:
-                        continue
-                    try:
-                        dir_date = datetime(
-                            int(key_parts[-4]), int(key_parts[-3]), int(key_parts[-2])
-                        )
-                    except (ValueError, IndexError):
-                        continue
-                    if dir_date >= cutoff_date:
-                        continue
-
-                    object_uri = backend.uri_for_key(object_key)
+                with self._index_lock:
+                    current_index = dict(self._load_upload_index(fail_on_error=True))
                     matching_keys = self._upload_index_keys_for_file(
                         current_index,
                         file,
@@ -811,10 +827,12 @@ class UploadHandler:
                             )
                             continue
 
-                    try:
-                        backend.delete(object_key)
-                    except Exception as e:
-                        if matching_keys:
+                # Lock released: network delete happens outside it.
+                try:
+                    backend.delete(object_key)
+                except Exception as e:
+                    if matching_keys:
+                        with self._index_lock:
                             try:
                                 self._atomic_write_json(
                                     uploads_db_path,
@@ -829,12 +847,11 @@ class UploadHandler:
                                 raise UploadCleanupSafetyError(
                                     "upload index rollback failed after object removal was refused"
                                 ) from e
-                        logger.warning(f"Failed to remove {object_uri}: {e}")
-                        continue
+                    logger.warning(f"Failed to remove {object_uri}: {e}")
+                    continue
 
-                    current_index = reduced_index
-                    cleaned_count += 1
-                    logger.info(f"Cleaned up old unreferenced upload: {object_uri}")
+                cleaned_count += 1
+                logger.info(f"Cleaned up old unreferenced upload: {object_uri}")
 
             logger.info(f"Upload cleanup completed: {cleaned_count} objects removed")
             return cleaned_count
@@ -1080,6 +1097,30 @@ class UploadHandler:
                 return dict(info)
         return None
 
+    def _probe_s3_presence(self, upload_id: str) -> Dict[str, bool]:
+        """Pre-lock object-existence probes for one upload's s3 rows.
+
+        Reads the index through the cache (no _index_lock: readers rely on
+        the atomic-replace + signature-validated cache, same as every other
+        lock-free _load_upload_index caller) and HEADs each s3:// path tied
+        to *upload_id*. reserve_upload then answers its in-lock existence
+        checks from this dict instead of performing network I/O under the
+        lock, so one S3 RTT cannot serialize concurrent chat sends with
+        attachments. Rows changed after the probe are re-checked in-lock.
+        """
+        try:
+            index = self._load_upload_index()
+        except Exception:
+            return {}
+        presence: Dict[str, bool] = {}
+        for info in index.values():
+            if not isinstance(info, dict) or info.get("id") != upload_id:
+                continue
+            path = info.get("path")
+            if is_s3_uri(path) and path not in presence:
+                presence[path] = self._stored_upload_present(path)
+        return presence
+
     def reserve_upload(
         self,
         upload_id: str,
@@ -1102,6 +1143,11 @@ class UploadHandler:
             return None
 
         uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
+        # Warm the object-existence probes BEFORE taking the index lock
+        # (double-checked pattern): the s3 branch below would otherwise
+        # issue one HEAD request per row while holding the lock, serializing
+        # every concurrent attachment reservation on an S3 RTT.
+        s3_presence = self._probe_s3_presence(upload_id)
         with self._index_lock:
             try:
                 current = dict(self._load_upload_index(fail_on_error=True))
@@ -1147,6 +1193,14 @@ class UploadHandler:
             if not owner and current_info.get("owner") is not None:
                 return None
 
+            def _s3_row_present(s3_path: str) -> bool:
+                # Pre-lock probe when available; live re-check only for rows
+                # the probe did not cover (index changed since the probe).
+                present = s3_presence.get(s3_path)
+                if present is None:
+                    present = self._stored_upload_present(s3_path)
+                return present
+
             existing_paths: set[str] = set()
             for row in matching_rows:
                 stored_path = row.get("path")
@@ -1165,7 +1219,7 @@ class UploadHandler:
                     key = self._s3_backend_for_row(stored_path).key_for_uri(stored_path)
                     if key is None or os.path.basename(key) != upload_id:
                         return None
-                    if self._stored_upload_present(stored_path):
+                    if _s3_row_present(stored_path):
                         existing_paths.add(stored_path)
                     continue
                 if not self._inside_upload_dir(stored_path):
@@ -1183,7 +1237,7 @@ class UploadHandler:
                 return None
             path = next(iter(existing_paths), None) or self._find_upload_path(upload_id)
             if is_s3_uri(path):
-                if not self._stored_upload_present(path):
+                if not _s3_row_present(path):
                     return None
             elif not path or not os.path.isfile(path) or not self._inside_upload_dir(path):
                 return None
@@ -1603,8 +1657,17 @@ class UploadHandler:
 
         try:
             backend.put(storage_key, file_obj, content_type)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+        except Exception:
+            # Log the full failure (botocore messages name the endpoint and
+            # credential state) server-side only; the client gets a generic
+            # detail so storage topology cannot leak to end users.
+            logger.exception(
+                "Failed to store upload %s (backend=%s, key=%r)",
+                file_id,
+                "s3" if backend.is_s3 else "local",
+                storage_key if not backend.is_s3 else backend.uri_for_key(storage_key),
+            )
+            raise HTTPException(status_code=500, detail="Failed to save file")
 
         # Create file metadata
         created_at = datetime.now().isoformat()
