@@ -44,3 +44,13 @@ PyMuPDF
 # [all]/Azure/audio extras (cloud + heavy). Pinned to a release >30 days old per
 # the dependency-age discussion in issue #485.
 markitdown[docx,pptx,xlsx,xls]==0.1.6
+
+# S3-compatible object storage backend for chat uploads
+# (ODYSSEUS_STORAGE_BACKEND=s3 — MinIO/Garage/AWS; see src/storage_backend.py).
+# Lazy-imported: with the default local backend the app runs fine without it.
+# NOTE: unlike the other optional extras, backend=s3 deliberately does NOT
+# degrade gracefully at first use — validate_storage_backend_at_boot() fails
+# fast at startup when boto3 is missing, so a half-configured S3 deployment is
+# visible in the container logs instead of silently losing uploads. Install
+# this extra when enabling the S3 backend.
+boto3
