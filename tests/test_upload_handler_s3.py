@@ -416,3 +416,174 @@ def test_cleanup_s3_spares_referenced_objects(tmp_path, monkeypatch):
     )
     assert cleaned == 0
     assert fake.exists(old_key)
+
+
+# ---------------------------------------------------------------------------
+# 2nd-round review follow-ups: rollback lost-update + sidecar companions
+# ---------------------------------------------------------------------------
+
+SIDECAR_SUFFIX = ".fields.json"
+
+
+def _old_row(fake: FakeS3Backend, key: str, upload_id: str, owner="alice") -> dict:
+    return {
+        "id": upload_id,
+        "path": fake.uri_for_key(key),
+        "mime": "text/plain",
+        "size": 10,
+        "name": upload_id,
+        "hash": f"hash-{upload_id[:4]}",
+        "checksum_sha256": f"hash-{upload_id[:4]}",
+        "original_name": upload_id,
+        "owner": owner,
+        "uploaded_at": "2020-01-01T00:00:00",
+        "created_at": "2020-01-01T00:00:00",
+        "last_accessed": "2020-01-01T00:00:00",
+    }
+
+
+def test_cleanup_s3_delete_failure_never_loses_concurrent_rows(tmp_path, monkeypatch):
+    """W3 mechanics: the object delete runs OUTSIDE _index_lock; a row an
+    upload writes in that window must survive the rollback. The old
+    wholesale snapshot restore wiped it (permanent attachment 404)."""
+    handler = _make_handler(tmp_path)
+    fake = FakeS3Backend()
+    _use_fake_backend(monkeypatch, fake)
+    handler.cleanup_days = 30
+
+    old_id = "a" * 32 + ".txt"
+    old_key = "2020/01/01/" + old_id
+    fake.objects[old_key] = b"old unreferenced"
+    old_row = _old_row(fake, old_key, old_id)
+    _seed_index_row(handler, old_row)
+
+    concurrent_id = "b" * 32 + ".txt"
+    concurrent_row = _old_row(fake, "2026/09/09/" + concurrent_id, concurrent_id, owner="bob")
+    concurrent_row["uploaded_at"] = "2026-09-09T00:00:00"
+    concurrent_row["last_accessed"] = "2026-09-09T00:00:00"
+
+    real_delete = fake.delete
+
+    def _delete_hook(key):
+        if key == old_key:
+            # A concurrent upload lands between the index reduction (lock
+            # released) and the network delete failing.
+            db_path = Path(handler.upload_dir) / "uploads.json"
+            with handler._index_lock:
+                live = json.loads(db_path.read_text(encoding="utf-8"))
+                live["bob:" + concurrent_row["hash"]] = concurrent_row
+                handler._atomic_write_json(str(db_path), live)
+            raise RuntimeError("simulated S3 delete failure")
+        return real_delete(key)
+
+    fake.delete = _delete_hook
+
+    cleaned = handler.cleanup_old_uploads(
+        referenced_upload_ids=set(),
+        referenced_upload_hashes=set(),
+    )
+
+    assert cleaned == 0  # delete failed: nothing counted
+    assert fake.exists(old_key)  # bytes untouched
+    index = _index(handler)
+    # BOTH rows survive: the rolled-back old row AND the concurrent upload.
+    ids_in_index = {row["id"] for row in index.values()}
+    assert old_id in ids_in_index
+    assert concurrent_id in ids_in_index
+
+
+def test_cleanup_s3_index_write_failure_rolls_back_and_continues(tmp_path, monkeypatch):
+    """The other restore point: the reduced index write itself fails. The
+    atomic write never landed, so the rollback must be a no-op (no second
+    failing write, no UploadCleanupSafetyError), and the sweep continues."""
+    handler = _make_handler(tmp_path)
+    fake = FakeS3Backend()
+    _use_fake_backend(monkeypatch, fake)
+    handler.cleanup_days = 30
+
+    old_id = "c" * 32 + ".txt"
+    old_key = "2020/01/01/" + old_id
+    fake.objects[old_key] = b"old unreferenced"
+    old_row = _old_row(fake, old_key, old_id)
+    _seed_index_row(handler, old_row)
+    old_index_key = f"alice:{old_row['hash']}"
+
+    real_write = handler._atomic_write_json
+
+    def _failing_write(path, data, **kwargs):
+        # Fail exactly the reduced write (the payload without the old row).
+        if old_index_key not in data:
+            raise OSError("disk full during reduced write")
+        return real_write(path, data, **kwargs)
+
+    monkeypatch.setattr(handler, "_atomic_write_json", _failing_write)
+
+    cleaned = handler.cleanup_old_uploads(
+        referenced_upload_ids=set(),
+        referenced_upload_hashes=set(),
+    )
+
+    assert cleaned == 0
+    assert fake.exists(old_key)  # delete never reached
+    ids_in_index = {row["id"] for row in _index(handler).values()}
+    assert old_id in ids_in_index  # row intact (atomic write never landed)
+
+
+def test_cleanup_s3_removes_sidecar_companion_with_parent(tmp_path, monkeypatch):
+    """Companions are backend-internal: removed together with the parent
+    object once the sweep deletes it — never as independent candidates."""
+    handler = _make_handler(tmp_path)
+    fake = FakeS3Backend()
+    _use_fake_backend(monkeypatch, fake)
+    handler.cleanup_days = 30
+
+    old_id = "d" * 32 + ".pdf"
+    old_key = "2020/01/01/" + old_id
+    fake.objects[old_key] = b"old form pdf"
+    fake.objects[old_key + SIDECAR_SUFFIX] = b"[]"
+    _seed_index_row(handler, _old_row(fake, old_key, old_id))
+
+    # A fresh, recent upload with its own companion must survive entirely.
+    fresh_meta = handler.save_upload(_fake_upload(b"fresh"), "127.0.0.1", owner="alice")
+    fresh_key = fake.key_for_uri(fresh_meta["path"])
+    fake.objects[fresh_key + SIDECAR_SUFFIX] = b"[]"
+
+    cleaned = handler.cleanup_old_uploads(
+        referenced_upload_ids=set(),
+        referenced_upload_hashes=set(),
+    )
+
+    assert cleaned == 1
+    assert not fake.exists(old_key)
+    assert not fake.exists(old_key + SIDECAR_SUFFIX)  # companion went too
+    assert fake.exists(fresh_key)
+    assert fake.exists(fresh_key + SIDECAR_SUFFIX)  # parent spared -> companion spared
+
+
+def test_cleanup_s3_never_touches_companions_of_kept_or_orphaned_parents(tmp_path, monkeypatch):
+    handler = _make_handler(tmp_path)
+    fake = FakeS3Backend()
+    _use_fake_backend(monkeypatch, fake)
+    handler.cleanup_days = 30
+
+    # Referenced OLD parent: both parent and companion survive.
+    ref_id = "e" * 32 + ".pdf"
+    ref_key = "2020/01/01/" + ref_id
+    fake.objects[ref_key] = b"referenced form pdf"
+    fake.objects[ref_key + SIDECAR_SUFFIX] = b"[]"
+    _seed_index_row(handler, _old_row(fake, ref_key, ref_id))
+
+    # Orphan companion (old shard, no parent object, no index row): the
+    # sweep fails closed on unknown ids and must never delete it on its own.
+    orphan_key = "2020/01/01/" + ("9" * 32 + ".pdf") + SIDECAR_SUFFIX
+    fake.objects[orphan_key] = b"[]"
+
+    cleaned = handler.cleanup_old_uploads(
+        referenced_upload_ids={ref_id},
+        referenced_upload_hashes=set(),
+    )
+
+    assert cleaned == 0
+    assert fake.exists(ref_key)
+    assert fake.exists(ref_key + SIDECAR_SUFFIX)
+    assert fake.exists(orphan_key)
