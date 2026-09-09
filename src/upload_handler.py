@@ -798,6 +798,11 @@ class UploadHandler:
                         for key, value in current_index.items()
                         if key not in matching_keys
                     }
+                    dropped_rows = {
+                        key: current_index[key]
+                        for key in matching_keys
+                        if key in current_index
+                    }
                     if matching_keys:
                         try:
                             self._atomic_write_json(
@@ -807,10 +812,8 @@ class UploadHandler:
                             )
                         except Exception as e:
                             try:
-                                self._atomic_write_json(
-                                    uploads_db_path,
-                                    current_index,
-                                    sync_backup=True,
+                                self._restore_cleanup_rows(
+                                    uploads_db_path, dropped_rows
                                 )
                             except Exception:
                                 logger.exception(
@@ -834,10 +837,8 @@ class UploadHandler:
                     if matching_keys:
                         with self._index_lock:
                             try:
-                                self._atomic_write_json(
-                                    uploads_db_path,
-                                    current_index,
-                                    sync_backup=True,
+                                self._restore_cleanup_rows(
+                                    uploads_db_path, dropped_rows
                                 )
                             except Exception:
                                 logger.exception(
@@ -851,6 +852,7 @@ class UploadHandler:
                     continue
 
                 cleaned_count += 1
+                self._delete_s3_companion_objects(backend, object_key)
                 logger.info(f"Cleaned up old unreferenced upload: {object_uri}")
 
             logger.info(f"Upload cleanup completed: {cleaned_count} objects removed")
@@ -976,6 +978,59 @@ class UploadHandler:
             self._index_signature = self._upload_index_signature(
                 (path, path + ".bak")
             )
+
+    def _restore_cleanup_rows(
+        self,
+        uploads_db_path: str,
+        dropped_rows: dict,
+    ) -> None:
+        """Lost-update-safe rollback for the cleanup paths.
+
+        The old rollback re-wrote a pre-cleanup index SNAPSHOT wholesale.
+        In the S3 sweep the object delete runs outside _index_lock, so a
+        concurrent upload can land a new row in that window — the snapshot
+        restore then wiped it, permanently 404-ing that attachment. Here we
+        re-read the LIVE index and re-insert ONLY the rows this cleanup
+        removed (dropped_rows, O(changed)); rows that changed or appeared
+        meanwhile are never overwritten. Writes only when something is
+        actually missing. The local sweep keeps its inline restores: its
+        whole walk holds _index_lock, so no such window exists there.
+
+        MUST be called while holding _index_lock (_index_lock is a plain
+        Lock, not an RLock — re-acquiring here would self-deadlock).
+        """
+        live = dict(self._load_upload_index(fail_on_error=True))
+        missing = {
+            key: row
+            for key, row in dropped_rows.items()
+            if key not in live
+        }
+        if not missing:
+            return
+        live.update(missing)
+        self._atomic_write_json(uploads_db_path, live, sync_backup=True)
+
+    @staticmethod
+    def _delete_s3_companion_objects(backend, object_key: str) -> None:
+        """Remove backend-internal companion objects of a deleted upload.
+
+        Field-schema sidecars (<object-key>.fields.json, src/pdf_form_doc)
+        are stored next to their parent object in the bucket and are NEVER
+        uploads.json rows, so they cannot be cleanup candidates on their
+        own (the sweep fails closed on unknown ids) — they are removed
+        here, together with the parent, after the parent delete succeeded.
+        Best-effort: a companion delete failure logs and moves on; the
+        parent removal must not be rolled back over bookkeeping bytes.
+        """
+        from src.pdf_form_doc import SIDECAR_SUFFIX
+
+        companion = object_key + SIDECAR_SUFFIX
+        try:
+            if backend.exists(companion):
+                backend.delete(companion)
+                logger.info(f"Cleaned up sidecar companion object: {companion}")
+        except Exception as e:
+            logger.warning(f"Failed to remove companion object {companion}: {e}")
 
     @staticmethod
     def _upload_index_signature(

@@ -96,7 +96,7 @@ def _materialized_upload(
     """Yield a LOCAL filesystem path for an upload the caller may read.
 
     The PDF routes feed pdf_path to helpers that need real files
-    (fitz.open, pypdf, field sidecars). Object-stored rows
+    (fitz.open, pypdf). Object-stored rows
     (ODYSSEUS_STORAGE_BACKEND=s3) are owner-resolved exactly like local
     rows (via _resolve_user_upload_path, which also gates the s3 URI to
     the managed bucket) and then downloaded once into a temp file whose
@@ -104,7 +104,9 @@ def _materialized_upload(
     working. The temp file is removed on exit — including on exceptions
     and early returns. Local rows yield their resolved path unchanged
     (zero new I/O). Yields None when the upload cannot be resolved;
-    callers map that to their existing 404s.
+    callers map that to their existing 404s. Field sidecars do NOT rely
+    on this copy: routes resolve the stored row path separately
+    (_stored_upload_path) so s3 schemas live in companion objects.
     """
     auth_manager = getattr(getattr(request, "app", None), "state", None)
     auth_manager = getattr(auth_manager, "auth_manager", None)
@@ -145,12 +147,31 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
 
         Replaces the old bare _locate_current_user_upload at the PDF call
         sites: object-stored sources are downloaded to a temp file so
-        fitz/pypdf/sidecar helpers keep working, and the file is cleaned
-        up when the route's `with` block exits.
+        fitz/pypdf keep working, and the file is cleaned up when the
+        route's `with` block exits. (Field sidecars no longer need the
+        local copy: see _stored_upload_path — s3 rows keep their schema in
+        a companion object next to the PDF in the bucket.)
         """
         if upload_handler is None:
             return _null_materialized_upload()
         return _materialized_upload(upload_handler, request, upload_id, user)
+
+    def _stored_upload_path(request: Request, upload_id: str, user: Optional[str]) -> Optional[str]:
+        """The uploads.json row's STORED path for an upload (owner-checked).
+
+        Local rows -> the absolute filesystem path (identical to the
+        materialized one); object-stored rows -> the s3://bucket/key URI.
+        Field-sidecar save/load take THIS so the schema lands next to the
+        real bytes: a local file for local rows, a companion object for
+        s3 rows (src/pdf_form_doc.py) — never next to the materialized
+        /tmp copy, which is deleted on route exit. Falls back to None when
+        the row cannot be resolved; callers then degrade as today.
+        """
+        if upload_handler is None:
+            return None
+        auth_manager = getattr(getattr(request, "app", None), "state", None)
+        auth_manager = getattr(auth_manager, "auth_manager", None)
+        return _resolve_user_upload_path(upload_handler, upload_id, user, auth_manager)
 
     def _load_pdf_viewer_fitz():
         from src.pdf_runtime import load_pymupdf_for_pdf_viewer
@@ -342,15 +363,32 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 logger.warning(f"has_form_fields failed for {pdf_path}: {e}")
 
             if is_form:
-                fields = extract_fields(pdf_path)
-                save_field_sidecar(pdf_path, fields)
-                doc_id = create_form_markdown_document(
-                    session_id=session_id,
-                    fields=fields,
-                    upload_id=upload_id,
-                    title=title,
-                    intro_text=body_text,
-                )
+                # Extraction runs on third-party PDFs: an unexpected fitz
+                # error must not escape the route (raw 500 + no doc). Degrade
+                # to the plain-PDF document instead — the user still gets
+                # the import, without the form overlays.
+                try:
+                    fields = extract_fields(pdf_path)
+                except Exception as e:
+                    logger.warning(f"extract_fields failed for {pdf_path}: {e}")
+                    fields = []
+                if fields:
+                    stored_path = _stored_upload_path(request, upload_id, user) or pdf_path
+                    save_field_sidecar(stored_path, fields)
+                    doc_id = create_form_markdown_document(
+                        session_id=session_id,
+                        fields=fields,
+                        upload_id=upload_id,
+                        title=title,
+                        intro_text=body_text,
+                    )
+                else:
+                    doc_id = create_plain_pdf_document(
+                        session_id=session_id,
+                        upload_id=upload_id,
+                        title=title,
+                        body_text=body_text,
+                    )
             else:
                 doc_id = create_plain_pdf_document(
                     session_id=session_id,
@@ -1145,7 +1183,9 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 if not pdf_path:
                     raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
 
-                fields = load_field_sidecar(pdf_path)
+                fields = load_field_sidecar(
+                    _stored_upload_path(request, upload_id, user) or pdf_path
+                )
                 if not fields:
                     raise HTTPException(404, "Field schema sidecar missing for source PDF")
 
@@ -1208,7 +1248,9 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                     raise HTTPException(404, f"Source PDF {upload_id} not found")
 
                 fitz = _load_pdf_viewer_fitz()
-                schema = load_field_sidecar(pdf_path) or []
+                schema = load_field_sidecar(
+                    _stored_upload_path(request, upload_id, user) or pdf_path
+                ) or []
                 values = parse_markdown_to_values(doc.current_content or "")
 
                 # Group fields by page
@@ -1577,7 +1619,9 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 if not pdf_path:
                     raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
 
-                schema = load_field_sidecar(pdf_path) or []
+                schema = load_field_sidecar(
+                    _stored_upload_path(request, upload_id, user) or pdf_path
+                ) or []
                 sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
 
                 all_values = parse_markdown_to_values(doc.current_content or "")
@@ -1717,7 +1761,9 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 if not pdf_path:
                     raise HTTPException(404, f"Source PDF {upload_id} not found")
 
-                schema = load_field_sidecar(pdf_path) or []
+                schema = load_field_sidecar(
+                    _stored_upload_path(request, upload_id, user) or pdf_path
+                ) or []
                 sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
                 all_values = parse_markdown_to_values(doc.current_content or "")
                 text_values: dict = {}

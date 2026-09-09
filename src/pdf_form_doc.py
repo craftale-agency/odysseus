@@ -19,7 +19,15 @@ import re
 import uuid
 from typing import Any, Optional
 
+from src.storage_backend import is_s3_uri
+
 logger = logging.getLogger(__name__)
+
+# Field-schema sidecar suffix. For object-stored rows this becomes part of
+# the companion object key (<object-key>.fields.json); for local rows it is
+# appended to the PDF path. Keep in sync with the cleanup companion logic
+# in UploadHandler._cleanup_old_uploads_s3.
+SIDECAR_SUFFIX = ".fields.json"
 
 
 _FRONT_MATTER_RE = re.compile(
@@ -139,12 +147,58 @@ _PLACEHOLDERS = {"_(empty)_", "_(not selected)_", "_(empty)_.", "_(unsigned)_"}
 
 
 def sidecar_path(pdf_path: str) -> str:
-    """Path of the field-schema JSON stored next to a PDF upload."""
-    return pdf_path + ".fields.json"
+    """Path of the field-schema JSON stored next to a LOCAL PDF upload."""
+    return pdf_path + SIDECAR_SUFFIX
+
+
+def _s3_sidecar_object(pdf_path: str):
+    """Resolve an s3:// PDF row to (backend, companion_object_key).
+
+    The sidecar companion is ``<object-key>.fields.json`` in the same
+    bucket — same backend, same date-sharded prefix, never a row in
+    uploads.json. Returns (None, None) for foreign buckets / bad URIs so
+    callers degrade exactly like today (no sidecar → regenerate).
+    """
+    from src import storage_backend
+
+    try:
+        backend = storage_backend._s3_backend_for_uri()
+    except Exception as e:  # pragma: no cover - env breakage
+        logger.warning(f"Cannot resolve storage backend for sidecar: {e}")
+        return None, None
+    key = backend.key_for_uri(pdf_path)
+    if key is None:
+        return None, None
+    return backend, key + SIDECAR_SUFFIX
 
 
 def save_field_sidecar(pdf_path: str, fields: list[dict[str, Any]]) -> str:
-    """Persist the field schema next to its source PDF. Returns the sidecar path."""
+    """Persist the field schema next to its source PDF. Returns the sidecar
+    location (a local path, or an s3:// URI for object-stored rows).
+
+    Local rows keep the historical ``<pdf>.fields.json`` file. Object-stored
+    rows (``s3://bucket/key``) store the schema as a COMPANION OBJECT
+    ``<key>.fields.json`` in the same bucket via the storage backend — the
+    callers used to write it next to a materialized /tmp copy, which was
+    orphaned on exit and lost for every later export/render. Companions are
+    backend-internal: they never appear as uploads.json rows, and cleanup
+    removes them together with their parent object.
+    """
+    if is_s3_uri(pdf_path):
+        backend, key = _s3_sidecar_object(pdf_path)
+        if backend is None:
+            logger.warning(
+                f"Cannot store field sidecar for foreign/invalid s3 row: {pdf_path}"
+            )
+            return sidecar_path(pdf_path)
+        try:
+            import io
+
+            payload = json.dumps(fields, indent=2).encode("utf-8")
+            backend.put(key, io.BytesIO(payload), "application/json")
+        except Exception as e:
+            logger.warning(f"Failed to write field sidecar object {key}: {e}")
+        return backend.uri_for_key(key)
     path = sidecar_path(pdf_path)
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -155,7 +209,24 @@ def save_field_sidecar(pdf_path: str, fields: list[dict[str, Any]]) -> str:
 
 
 def load_field_sidecar(pdf_path: str) -> Optional[list[dict[str, Any]]]:
-    """Return field schema for a PDF, or None if no sidecar exists."""
+    """Return field schema for a PDF, or None if no sidecar exists.
+
+    Object-stored rows read the companion object through the backend;
+    any failure (missing companion, network, decode) returns None so the
+    callers regenerate/degrade exactly as they already do for a missing
+    local sidecar file.
+    """
+    if is_s3_uri(pdf_path):
+        backend, key = _s3_sidecar_object(pdf_path)
+        if backend is None:
+            return None
+        try:
+            raw = backend.get_bytes(key)
+            loaded = json.loads(raw.decode("utf-8"))
+            return loaded if isinstance(loaded, list) else None
+        except Exception as e:
+            logger.warning(f"Failed to read field sidecar object {key}: {e}")
+            return None
     path = sidecar_path(pdf_path)
     if not os.path.exists(path):
         return None
