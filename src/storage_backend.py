@@ -486,8 +486,11 @@ def validate_storage_backend_at_boot() -> None:
 
     No-op for the default local backend. For s3, every required env var
     must be set AND boto3 must be importable, otherwise RuntimeError names
-    exactly what is missing. There is NEVER a silent fallback to local —
-    a half-configured S3 deployment must be visible in the container logs.
+    exactly what is missing. When the optional read cache is configured
+    (ODYSSEUS_S3_CACHE_DIR) its cap must parse and the dir must be
+    creatable/writable and NOT inside the uploads dir. There is NEVER a
+    silent fallback to local — a half-configured S3 deployment must be
+    visible in the container logs.
     """
     name = _requested_backend_name()
     if name != "s3":

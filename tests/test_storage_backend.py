@@ -286,13 +286,21 @@ def test_read_attachment_bytes_dispatches_on_s3_prefix(monkeypatch):
 
 
 def test_read_attachment_bytes_rejects_foreign_bucket(monkeypatch):
+    get_bytes_calls = []
+
     class _FakeS3(S3Backend):
         def __init__(self):
             super().__init__(bucket="buck")
 
+        def get_bytes(self, key):
+            get_bytes_calls.append(key)
+            return b"must-never-be-returned"
+
     monkeypatch.setattr(storage_backend, "_s3_backend_for_uri", lambda: _FakeS3())
     with pytest.raises(ValueError, match="bucket"):
         read_attachment_bytes({"path": "s3://other/key"})
+    # The foreign bucket is rejected BEFORE any byte fetch crosses the wire.
+    assert not get_bytes_calls
 
 
 def test_read_attachment_bytes_input_validation():

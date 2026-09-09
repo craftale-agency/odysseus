@@ -446,6 +446,10 @@ def build_user_content(
             continue
 
         path = upload_info.get("path")
+        # Row's stored location (local path or s3:// URI) — kept pristine for
+        # sidecar companion writes: the schema must land next to the REAL
+        # bytes, not next to the disposable materialized /tmp copy below.
+        stored_path = path
         _s3_tmp_dir: str | None = None
         if is_s3_uri(path):
             # Object-stored attachment (ODYSSEUS_STORAGE_BACKEND=s3 row).
@@ -567,7 +571,9 @@ def build_user_content(
 
                             if is_form:
                                 fields = extract_fields(path)
-                                save_field_sidecar(path, fields)
+                                # stored_path: s3:// URI for object rows
+                                # (companion object), local path otherwise.
+                                save_field_sidecar(stored_path, fields)
                                 doc_id = create_form_markdown_document(
                                     session_id=session_id,
                                     fields=fields,
