@@ -265,26 +265,18 @@ def test_cache_open_failure_upload_still_succeeds(monkeypatch, tmp_path):
     assert _cache_files(wrapper) == set()
 
 
-def test_cache_midstream_failure_upload_still_succeeds_unseekable(monkeypatch, tmp_path):
-    """Disk dies halfway through the spill with an unseekable source: the
-    already-spilled prefix must be chained onto the unread remainder so S3
-    still receives the complete stream."""
+def test_unseekable_source_put_is_uncached_passthrough(tmp_path):
+    """C1 regression lock: an unseekable source must never be teed into the
+    cache — a mid-stream cache failure on such a source would have no way
+    to re-upload the whole content and could store truncated bytes in S3.
+    The upload goes straight through, uncached."""
     fake = FakeS3Backend()
     wrapper = _make_cached(tmp_path, fake=fake)
-    data = b"0123456789abcdef"
     key = "2026/09/09/" + "f" * 32 + ".bin"
 
-    def _partial_spill(fd, fileobj):
-        prefix = fileobj.read(8)  # consume half the stream like a real spill
-        os.write(fd, prefix)
-        os.close(fd)
-        raise OSError("disk full mid-write")
+    wrapper.put(key, _Unseekable(b"streamed-content"), "text/plain")
 
-    monkeypatch.setattr(wrapper, "_spill_to_cache", _partial_spill)
-
-    wrapper.put(key, _Unseekable(data), "text/plain")  # must NOT raise
-
-    assert fake.objects[key] == data  # prefix + remainder reassembled
+    assert fake.objects[key] == b"streamed-content"
     assert _cache_files(wrapper) == set()
 
 
@@ -622,3 +614,186 @@ def test_boot_validation_cache_dir_ignored_for_local_backend(monkeypatch, tmp_pa
     monkeypatch.setenv(storage_backend.ENV_STORAGE_BACKEND, "local")
     monkeypatch.setenv(ENV_S3_CACHE_DIR, str(tmp_path / "unused"))
     assert validate_storage_backend_at_boot() is None
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: C1/W1/W2/W4b/W5/S1/S4 regressions
+# ---------------------------------------------------------------------------
+
+def test_get_stream_hit_open_failure_falls_back_to_s3(tmp_path, monkeypatch):
+    """W1: the hit-path open is unguarded against a concurrent eviction —
+    the download must fall back to S3 instead of surfacing a 500."""
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, fake=fake)
+    key = "2026/09/09/" + "a" * 32 + ".bin"
+    fake.objects[key] = b"served-by-s3"
+
+    def _vanished(key):
+        raise FileNotFoundError(f"evicted mid-request: {key}")
+
+    monkeypatch.setattr(wrapper, "_serve_local_chunks", _vanished)
+
+    # No exception; bytes come from S3 (first via populate, then the
+    # fallback stream after the post-populate serve also "fails").
+    assert b"".join(wrapper.get_stream(key)) == b"served-by-s3"
+
+
+def test_get_bytes_hit_size_mismatch_invalidates_and_repairs(tmp_path):
+    """W4b: a cache file whose length disagrees with the index must never be
+    served — drop it, fetch from S3, re-populate."""
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, fake=fake)
+    key = "2026/09/09/" + "b" * 32 + ".bin"
+    fake.objects[key] = b"real-s3-content"
+
+    cache_file = Path(wrapper.cache_dir) / key.replace("/", "__")
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_bytes(b"short")  # truncated local copy
+    (Path(wrapper.cache_dir) / "cache-index.json").write_text(
+        json.dumps({key: {"size": 99, "atime": 1.0}}), encoding="utf-8"
+    )
+
+    assert wrapper.get_bytes(key) == b"real-s3-content"
+    assert len(fake.get_calls) == 1  # fell through to S3 exactly once
+    assert cache_file.read_bytes() == b"real-s3-content"  # repaired
+    assert wrapper.get_bytes(key) == b"real-s3-content"
+    assert len(fake.get_calls) == 1  # hit again, locally
+
+
+def test_get_stream_hit_size_mismatch_falls_back_and_repairs(tmp_path):
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, fake=fake)
+    key = "2026/09/09/" + "c" * 32 + ".bin"
+    fake.objects[key] = b"real"
+
+    cache_file = Path(wrapper.cache_dir) / key.replace("/", "__")
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_bytes(b"short")
+    (Path(wrapper.cache_dir) / "cache-index.json").write_text(
+        json.dumps({key: {"size": 99, "atime": 1.0}}), encoding="utf-8"
+    )
+
+    assert b"".join(wrapper.get_stream(key)) == b"real"
+    assert cache_file.read_bytes() == b"real"
+
+
+def test_garbage_index_sizes_and_atimes_are_coerced_not_fatal(tmp_path):
+    """W2: a valid-JSON index with garbage shapes must not raise ValueError
+    out of eviction math (which runs AFTER a successful S3 put -> would 500
+    the upload)."""
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, max_bytes=20, fake=fake)
+    keys = []
+    for name in ("a", "b"):
+        key = f"2026/09/09/{name * 32}.bin"
+        wrapper.put(key, io.BytesIO(b"x" * 10), "text/plain")
+        keys.append(key)
+
+    index = _index_on_disk(wrapper)
+    index[keys[0]]["size"] = "not-a-number"
+    index[keys[1]] = {"size": None, "atime": "soon"}
+    (Path(wrapper.cache_dir) / "cache-index.json").write_text(
+        json.dumps(index), encoding="utf-8"
+    )
+
+    reborn = CachedS3Storage(fake, cache_dir=wrapper.cache_dir, max_bytes=20)
+    assert reborn.get_bytes(keys[0]) == b"x" * 10  # hit still serves
+
+    third = "2026/09/09/" + "d" * 32 + ".bin"
+    reborn.put(third, io.BytesIO(b"z" * 10), "text/plain")  # must not raise
+    final = _index_on_disk(reborn)
+    assert keys[1] not in final  # coerced atime 0.0 = oldest, evicted
+    assert keys[0] in final and third in final
+
+
+def test_oversize_put_aborts_spill_early(tmp_path, monkeypatch):
+    """S1: an object bigger than the cap must not be fully spilled just to
+    be discarded — the spill stops early and the upload still completes."""
+    from src.storage_cache import CHUNK_BYTES, SPILL_OVERSIZE
+
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, max_bytes=2 * CHUNK_BYTES, fake=fake)
+    data = b"y" * (5 * CHUNK_BYTES)
+    key = "2026/09/09/" + "e" * 32 + ".bin"
+
+    class _Counting(io.BytesIO):
+        reads = 0
+
+        def read(self, n=-1):
+            type(self).reads += 1
+            return super().read(n)
+
+    spy_results = []
+    real_spill = wrapper._spill_to_cache
+
+    def _spying_spill(fd, fileobj):
+        result = real_spill(fd, fileobj)
+        spy_results.append(result)
+        return result
+
+    monkeypatch.setattr(wrapper, "_spill_to_cache", _spying_spill)
+
+    source = _Counting(data)
+    wrapper.put(key, source, "application/octet-stream")
+
+    assert spy_results == [SPILL_OVERSIZE]  # early-abort sentinel returned
+    # 3 spill reads (aborted once over cap) + 1 full re-read for the direct
+    # upload = 4; a full spill would have needed 5 payload reads + an EOF probe.
+    assert _Counting.reads == 4
+    assert fake.objects[key] == data  # complete content reached S3
+    assert _cache_files(wrapper) == set()  # no cache copy, no temp leftovers
+
+
+def test_pathological_keys_never_touch_the_cache(tmp_path):
+    """S4: a hand-crafted uploads.json row with key ".." (or any slash-less
+    key) must resolve against S3 only — the flat mapping would otherwise
+    point at the cache dir's parent, and getsize() on a directory succeeds,
+    making exists() lie."""
+    fake = FakeS3Backend()
+    wrapper = _make_cached(tmp_path, fake=fake)
+    parent_dir = os.path.dirname(wrapper.cache_dir)
+    parent_listing_before = set(os.listdir(parent_dir))
+
+    wrapper.put("..", io.BytesIO(b"payload"), "text/plain")
+    assert fake.objects[".."] == b"payload"  # reached S3
+    assert wrapper.exists("..") is True  # answered by S3, not the parent dir
+
+    fake.objects.pop("..")  # now S3 says no; the parent dir still exists
+    assert wrapper.exists("..") is False
+    assert wrapper.stat("..") is None
+    with pytest.raises(FileNotFoundError):
+        wrapper.get_bytes("..")
+    with pytest.raises(FileNotFoundError):
+        b"".join(wrapper.get_stream(".."))
+    wrapper.delete("..")  # must not attempt to unlink the parent dir
+
+    # Slash-less keys are equally uncached.
+    wrapper.put("plainname", io.BytesIO(b"x"), "text/plain")
+    assert fake.objects["plainname"] == b"x"
+    assert wrapper.exists("plainname") is True  # answered by S3, never the dir
+    fake.objects.pop("plainname")
+    assert wrapper.exists("plainname") is False
+    assert set(os.listdir(parent_dir)) == parent_listing_before
+    assert _cache_files(wrapper) == set()
+
+
+def test_boot_validation_rejects_cache_dir_inside_uploads(monkeypatch, tmp_path):
+    """W5: the placement contract is enforced at boot, not just documented."""
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    monkeypatch.setattr("src.constants.UPLOAD_DIR", str(uploads))
+
+    _set_s3_env(monkeypatch, **{ENV_S3_CACHE_DIR: str(uploads / "s3-cache")})
+    with pytest.raises(RuntimeError, match=ENV_S3_CACHE_DIR):
+        validate_storage_backend_at_boot()
+    assert not (uploads / "s3-cache").exists()  # nothing created inside it
+
+    # Equal to the uploads root is rejected too...
+    monkeypatch.setenv(ENV_S3_CACHE_DIR, str(uploads))
+    with pytest.raises(RuntimeError, match=ENV_S3_CACHE_DIR):
+        validate_storage_backend_at_boot()
+
+    # ...while a sibling dir of uploads is the blessed shape.
+    monkeypatch.setenv(ENV_S3_CACHE_DIR, str(tmp_path / "s3-cache"))
+    validate_storage_backend_at_boot()
+    assert (tmp_path / "s3-cache").is_dir()

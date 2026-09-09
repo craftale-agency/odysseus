@@ -529,6 +529,21 @@ def validate_storage_backend_at_boot() -> None:
     cache_dir = os.getenv(ENV_S3_CACHE_DIR, "").strip()
     if cache_dir:
         resolve_cache_max_bytes()  # raises RuntimeError on garbage input
+        # Placement contract: the local upload-cleanup walker enumerates
+        # UPLOAD_DIR, so cache files must never live inside it (and never
+        # BE it). Checked before anything is created on disk.
+        from src.constants import UPLOAD_DIR
+        real_cache = os.path.realpath(cache_dir)
+        real_uploads = os.path.realpath(UPLOAD_DIR)
+        if (real_cache == real_uploads
+                or real_cache.startswith(real_uploads + os.sep)):
+            raise RuntimeError(
+                f"{ENV_S3_CACHE_DIR} must not be the uploads directory or "
+                f"live inside it (cache={real_cache!r}, "
+                f"uploads={real_uploads!r}): the local upload-cleanup walker "
+                "would treat cache files as uploads. Use a sibling dir like "
+                "<DATA_DIR>/s3-cache instead."
+            )
         try:
             os.makedirs(cache_dir, exist_ok=True)
             probe = os.path.join(cache_dir, ".write-probe")

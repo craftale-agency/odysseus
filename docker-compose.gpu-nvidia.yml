@@ -72,11 +72,13 @@ services:
       - ODYSSEUS_S3_PATH_STYLE=${ODYSSEUS_S3_PATH_STYLE:-true}
       # Optional write-through LRU read cache for the S3 backend
       # (src/storage_cache.py). Empty (default) = disabled, plain S3Backend.
-      # Set on hosts where S3 sits behind a thin WAN uplink (e.g.
-      # /app/data/s3-cache, inside the odysseus-data volume); keep empty
-      # when S3 is LAN-local — the cache is harmless but useless there.
+      # Set the dir on hosts where S3 sits behind a thin WAN uplink (e.g.
+      # /app/data/s3-cache, inside the odysseus-data volume but NEVER under
+      # /app/data/uploads); keep empty when S3 is LAN-local — the cache is
+      # harmless but useless there. The size cap defaults to 2 GiB in code
+      # when unset/empty.
       - ODYSSEUS_S3_CACHE_DIR=${ODYSSEUS_S3_CACHE_DIR:-}
-      - ODYSSEUS_S3_CACHE_MAX_BYTES=${ODYSSEUS_S3_CACHE_MAX_BYTES:-2147483648}
+      - ODYSSEUS_S3_CACHE_MAX_BYTES=${ODYSSEUS_S3_CACHE_MAX_BYTES:-}
       # Comma-separated list of proxy hostnames that front an Ollama
       # OpenAI-compat /v1 endpoint (e.g. langfuse-openai-proxy via Cloudflare
       # Tunnel). When set, Odysseus forwards `think: false` to thinking models
