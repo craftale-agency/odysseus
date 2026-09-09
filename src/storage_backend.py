@@ -18,6 +18,10 @@ are mandatory — there is deliberately NO silent fallback to local):
     ODYSSEUS_S3_REGION         region   (default us-east-1)
     ODYSSEUS_S3_PATH_STYLE     "true"/"1" (default) -> path-style addressing,
                                required by most self-hosted S3 servers
+    ODYSSEUS_S3_CACHE_DIR      optional write-through LRU read cache root
+                               (src/storage_cache.py). Empty/absent (the
+                               default) = cache disabled, plain S3Backend.
+    ODYSSEUS_S3_CACHE_MAX_BYTES  cache eviction cap, default 2147483648 (2 GiB)
 
 uploads.json keeps storing a single "path" value per row; for S3 rows that
 value is the URI form ``s3://<bucket>/<object key>`` while local rows keep
@@ -42,6 +46,11 @@ ENV_S3_SECRET_KEY = "ODYSSEUS_S3_SECRET_KEY"
 ENV_S3_BUCKET = "ODYSSEUS_S3_BUCKET"
 ENV_S3_REGION = "ODYSSEUS_S3_REGION"
 ENV_S3_PATH_STYLE = "ODYSSEUS_S3_PATH_STYLE"
+ENV_S3_CACHE_DIR = "ODYSSEUS_S3_CACHE_DIR"
+ENV_S3_CACHE_MAX_BYTES = "ODYSSEUS_S3_CACHE_MAX_BYTES"
+
+# LRU cache cap applied when ODYSSEUS_S3_CACHE_DIR is set (src/storage_cache.py).
+DEFAULT_S3_CACHE_MAX_BYTES = 2147483648  # 2 GiB
 
 # Missing any of these with backend=s3 aborts startup instead of degrading.
 REQUIRED_S3_ENV: Tuple[str, ...] = (
@@ -389,7 +398,11 @@ def get_storage_backend() -> StorageBackend:
     The environment is read when the singleton is first requested (call
     time), never at import time — mirroring get_chroma_client(). A
     backend=s3 selection with missing required env raises instead of
-    silently degrading to local.
+    silently degrading to local. When ODYSSEUS_S3_CACHE_DIR is set on top
+    of backend=s3 the S3Backend is wrapped in the write-through LRU read
+    cache (CachedS3Storage, an S3Backend subclass, so every isinstance /
+    is_s3 / uri-helper check keeps working); unset or empty keeps the plain
+    S3Backend with zero behavior change.
     """
     global _BACKEND
     if _BACKEND is not None:
@@ -403,11 +416,22 @@ def get_storage_backend() -> StorageBackend:
                 + ", ".join(missing)
                 + " to be set (non-empty). Refusing to fall back to local storage."
             )
-        _BACKEND = S3Backend()
-        logger.info(
-            "Storage backend: s3 (bucket=%s endpoint=%s path_style=%s)",
-            _BACKEND.bucket, _BACKEND.endpoint_url, _BACKEND.path_style,
-        )
+        cache_dir = os.getenv(ENV_S3_CACHE_DIR, "").strip()
+        if cache_dir:
+            from src.storage_cache import CachedS3Storage
+            _BACKEND = CachedS3Storage(S3Backend(), cache_dir=cache_dir)
+            logger.info(
+                "Storage backend: s3 + read cache (bucket=%s endpoint=%s "
+                "path_style=%s cache_dir=%s max_bytes=%d)",
+                _BACKEND.bucket, _BACKEND.endpoint_url, _BACKEND.path_style,
+                cache_dir, _BACKEND.max_bytes,
+            )
+        else:
+            _BACKEND = S3Backend()
+            logger.info(
+                "Storage backend: s3 (bucket=%s endpoint=%s path_style=%s)",
+                _BACKEND.bucket, _BACKEND.endpoint_url, _BACKEND.path_style,
+            )
     else:
         from src.constants import UPLOAD_DIR
         _BACKEND = LocalBackend(UPLOAD_DIR)
@@ -497,3 +521,41 @@ def validate_storage_backend_at_boot() -> None:
             "pip install -r requirements-optional.txt "
             "(missing dependency: boto3)"
         ) from e
+    # Optional read cache (src/storage_cache.py): no new required vars, but
+    # a configured cache dir must be creatable/writable and the cap must
+    # parse — a cache that cannot be written would silently cost a WAN
+    # round trip on every read, so surface it at boot instead.
+    from src.storage_cache import resolve_cache_max_bytes
+    cache_dir = os.getenv(ENV_S3_CACHE_DIR, "").strip()
+    if cache_dir:
+        resolve_cache_max_bytes()  # raises RuntimeError on garbage input
+        # Placement contract: the local upload-cleanup walker enumerates
+        # UPLOAD_DIR, so cache files must never live inside it (and never
+        # BE it). Checked before anything is created on disk.
+        from src.constants import UPLOAD_DIR
+        real_cache = os.path.realpath(cache_dir)
+        real_uploads = os.path.realpath(UPLOAD_DIR)
+        if (real_cache == real_uploads
+                or real_cache.startswith(real_uploads + os.sep)):
+            raise RuntimeError(
+                f"{ENV_S3_CACHE_DIR} must not be the uploads directory or "
+                f"live inside it (cache={real_cache!r}, "
+                f"uploads={real_uploads!r}): the local upload-cleanup walker "
+                "would treat cache files as uploads. Use a sibling dir like "
+                "<DATA_DIR>/s3-cache instead."
+            )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            probe = os.path.join(cache_dir, ".write-probe")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            raise RuntimeError(
+                f"{ENV_S3_CACHE_DIR} is not creatable/writable "
+                f"({cache_dir!r}): {e}. Refusing to start with a broken S3 "
+                "read cache — unset it or point it at a writable path "
+                "outside the uploads dir (e.g. <DATA_DIR>/s3-cache)."
+            ) from e
+    else:
+        resolve_cache_max_bytes()  # still validate the cap when provided
