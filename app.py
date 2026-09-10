@@ -509,16 +509,75 @@ class _RevalidatingStatic(StaticFiles):
 app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
 # ========= GENERATED IMAGES =========
+def _gallery_s3_stored_for_url(filename: str, request: Request):
+    """Return the s3:// stored value behind a URL basename, or None.
+
+    Object-stored gallery rows (ODYSSEUS_GALLERY_STORAGE=s3) keep an
+    s3://bucket/gallery/... URI in the gallery row while URLs keep using
+    the bare basename — this resolves one to the other with the SAME
+    ownership rule the local branch enforces (row with a different owner
+    → 404, don't confirm existence)."""
+    from src.auth_helpers import get_current_user
+    from core.database import SessionLocal as _SL, GalleryImage as _GI
+    from src.gallery_storage import gallery_stored_from_url_name
+
+    try:
+        _user = get_current_user(request)
+        _db = _SL()
+        try:
+            stored = gallery_stored_from_url_name(filename, _db)
+            if stored is None:
+                return None
+            _row = (
+                _db.query(_GI)
+                .filter(_GI.filename == stored, _GI.is_active == True)  # noqa: E712
+                .first()
+            )
+            if _row is None:
+                return None
+            if _user and _row.owner and _row.owner != _user:
+                raise HTTPException(status_code=404, detail="Image not found")
+            return stored
+        finally:
+            _db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        return None
+
+
 @app.get("/api/generated-image/{filename}")
 async def serve_generated_image(filename: str, request: Request):
-    """Serve generated images from the data directory."""
-    img_path = resolve_generated_image_path(filename)
+    """Serve generated images: local file fast path, then object-stored
+    gallery rows (streamed from the storage backend, same immutable-cache
+    headers — no presigned URLs, everything stays server-mediated)."""
+    try:
+        img_path = resolve_generated_image_path(filename)
+    except HTTPException:
+        # Not on local disk: maybe an object-stored gallery row (migration
+        # or s3-mode upload). Resolve it or 404 exactly like before.
+        _stored = _gallery_s3_stored_for_url(filename, request)
+        if _stored is None:
+            raise
+        from src.gallery_storage import _gallery_backend, gallery_mime_for
+        from src.storage_backend import parse_s3_uri
+        from starlette.responses import StreamingResponse
+
+        _backend = _gallery_backend()
+        _key = _backend.key_for_uri(_stored)
+        if _key is None:
+            raise HTTPException(status_code=404, detail="Image not found")
+        return StreamingResponse(
+            _backend.get_stream(_key),
+            media_type=gallery_mime_for(filename),
+            headers=GENERATED_IMAGE_HEADERS,
+        )
     # SECURITY: filename is the only key, so anyone who knows / guesses a
     # 12-hex content hash could pull another user's image bytes. Require
     # auth and verify ownership via the gallery row (when one exists).
     try:
         from src.auth_helpers import get_current_user
-        from core.database import SessionLocal as _SL, GalleryImage as _GI
+        from core.database import SessionLocal as _SL
         _user = get_current_user(request)
         if _user:
             _db = _SL()

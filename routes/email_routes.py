@@ -4125,11 +4125,22 @@ def setup_email_routes():
                 raise HTTPException(status_code=404, detail="Image not found")
             if owner and img.owner and img.owner != owner:
                 raise HTTPException(status_code=404, detail="Image not found")
+            # Storage dispatch: object-stored rows hand the caller bytes
+            # (both compose endpoints already support {"content": ...}),
+            # local rows keep the confined-path fast path.
+            from src.gallery_storage import gallery_local_path, gallery_read_bytes, gallery_url_name
+            from src.storage_backend import is_s3_uri as _is_s3_uri
+            _name = gallery_url_name(img.filename) or "gallery-image.png"
+            if _is_s3_uri(img.filename):
+                return {
+                    "filename": _safe_compose_filename(_name),
+                    "content": gallery_read_bytes(img.filename),
+                }
             from routes.gallery.gallery_routes import _gallery_image_path
             src = _gallery_image_path(img.filename)
             if not src.exists() or not src.is_file():
                 raise HTTPException(status_code=404, detail="Image file not found")
-            return {"filename": _safe_compose_filename(img.filename or "gallery-image.png"), "path": src}
+            return {"filename": _safe_compose_filename(_name), "path": src}
 
         raise HTTPException(status_code=400, detail="Unknown attachment kind")
 

@@ -185,7 +185,10 @@ async def test_chat_image_upload_is_added_to_gallery(tmp_path, monkeypatch):
     gallery_dir = tmp_path / "generated_images"
 
     monkeypatch.setattr(up, "SessionLocal", TestingSession)
-    monkeypatch.setattr(up, "GENERATED_IMAGES_DIR", str(gallery_dir))
+    # The gallery copy resolves its local dir through the gallery module's
+    # seam (src/gallery_storage._local_gallery_dir), so patch that one.
+    import routes.gallery.gallery_routes as _gr
+    monkeypatch.setattr(_gr, "GALLERY_IMAGE_DIR", gallery_dir)
 
     h = UploadHandler(base_dir=str(tmp_path), upload_dir=str(tmp_path / "uploads"))
     up.setup_upload_routes(h)
@@ -216,7 +219,6 @@ async def test_non_image_chat_upload_is_not_added_to_gallery(tmp_path, monkeypat
     cdb.Base.metadata.create_all(engine)
     TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     monkeypatch.setattr(up, "SessionLocal", TestingSession)
-    monkeypatch.setattr(up, "GENERATED_IMAGES_DIR", str(tmp_path / "generated_images"))
 
     h = UploadHandler(base_dir=str(tmp_path), upload_dir=str(tmp_path / "uploads"))
     up.setup_upload_routes(h)

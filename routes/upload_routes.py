@@ -26,7 +26,6 @@ from core.database import (
 )
 from src.auth_helpers import effective_user
 from src.attachment_refs import attachment_refs_from_metadata
-from src.constants import GENERATED_IMAGES_DIR
 from src.storage_backend import is_s3_uri
 from src.upload_handler import (
     UploadCleanupSafetyError,
@@ -253,6 +252,10 @@ def setup_upload_routes(upload_handler):
             return None
 
         db = SessionLocal()
+        # Bound up-front so the compensation in the except below can never
+        # hit a NameError when the failure happens before the store (which
+        # would swallow the real error into the cleanup log).
+        stored_value = None
         try:
             file_hash = meta.get("hash")
             if file_hash:
@@ -266,8 +269,6 @@ def setup_upload_routes(upload_handler):
                 if existing:
                     return existing.id
 
-            image_dir = Path(GENERATED_IMAGES_DIR)
-            image_dir.mkdir(parents=True, exist_ok=True)
             ext = Path(meta.get("name") or source_path).suffix.lower()
             if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                 mime_ext = {
@@ -278,17 +279,20 @@ def setup_upload_routes(upload_handler):
                     "image/gif": ".gif",
                 }.get(meta.get("mime", ""))
                 ext = mime_ext or ".png"
-            filename = f"{uuid.uuid4().hex[:12]}{ext}"
-            dest_path = image_dir / filename
+            # Storage dispatch (ODYSSEUS_GALLERY_STORAGE): gallery assets go
+            # to the object backend when armed; otherwise the historical
+            # GENERATED_IMAGES_DIR file (source read once, either way).
+            from src.gallery_storage import gallery_store_image
             if s3_image_bytes is not None:
-                dest_path.write_bytes(s3_image_bytes)
+                _content = s3_image_bytes
             else:
-                shutil.copy2(source_path, dest_path)
+                _content = Path(source_path).read_bytes()
+            stored_value, filename = gallery_store_image(_content, ext.lstrip("."))
 
             image_id = str(uuid.uuid4())
             db.add(GalleryImage(
                 id=image_id,
-                filename=filename,
+                filename=stored_value,
                 prompt=meta.get("name") or "Chat upload",
                 model="chat-upload",
                 owner=owner,
@@ -303,6 +307,18 @@ def setup_upload_routes(upload_handler):
         except Exception as e:
             db.rollback()
             logger.warning("Failed to add chat image upload to gallery: %s", e)
+            # W6 compensation: bytes already reached storage; without a row
+            # the asset 404s forever and nothing sweeps the object. Skipped
+            # when the failure predates the store (nothing to compensate).
+            if stored_value is not None:
+                try:
+                    from src.gallery_storage import gallery_delete_stored
+                    gallery_delete_stored(stored_value)
+                except Exception as comp_e:
+                    logger.warning(
+                        "Gallery object cleanup failed for %r (orphaned): %s",
+                        stored_value, comp_e,
+                    )
             return None
         finally:
             db.close()

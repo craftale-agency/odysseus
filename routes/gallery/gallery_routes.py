@@ -228,6 +228,18 @@ def _sanitize_gallery_filename(filename: str) -> str:
 
 GALLERY_IMAGE_DIR = Path(GENERATED_IMAGES_DIR)
 
+# Storage-backend dispatch for gallery assets (ODYSSEUS_GALLERY_STORAGE).
+from src.gallery_storage import (  # noqa: E402
+    gallery_delete_stored,
+    gallery_local_path,
+    gallery_read_bytes,
+    gallery_store_image,
+    gallery_url_name,
+    gallery_write_stored,
+    migrate_gallery_assets_to_backend,
+)
+from src.storage_backend import is_s3_uri as _gallery_is_s3
+
 
 def _gallery_image_path(filename: str) -> Path:
     """Resolve a stored gallery filename without leaving generated_images."""
@@ -385,18 +397,16 @@ def setup_gallery_routes() -> APIRouter:
                 return {"ok": False, "duplicate": True, "filename": existing.filename,
                         "id": existing.id, "message": "Duplicate photo skipped"}
 
-            img_dir = Path(GENERATED_IMAGES_DIR)
-            img_dir.mkdir(parents=True, exist_ok=True)
-
             ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
             VIDEO_EXTS = {"mp4", "mov", "webm", "mkv", "m4v"}
             IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "gif"}
             if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
                 raise HTTPException(400, f"Unsupported file type: .{ext}")
             is_video = ext in VIDEO_EXTS
-            filename = f"{uuid.uuid4().hex[:12]}.{ext}"
-            img_path = img_dir / filename
-            img_path.write_bytes(content)
+            # Storage dispatch (ODYSSEUS_GALLERY_STORAGE): object-stored rows
+            # keep an s3:// URI in `filename`; local rows keep the bare name.
+            # `filename` below stays the URL-facing bare name either way.
+            stored_value, filename = gallery_store_image(content, ext)
 
             # Extract EXIF for images only — PIL can't parse video containers
             # and the failure path logs a noisy WARNING. We'll add ffprobe-based
@@ -407,7 +417,7 @@ def setup_gallery_routes() -> APIRouter:
             img_id = str(uuid.uuid4())
             db.add(GalleryImage(
                 id=img_id,
-                filename=filename,
+                filename=stored_value,
                 prompt=original_name,
                 model="imported",
                 owner=user,
@@ -422,7 +432,21 @@ def setup_gallery_routes() -> APIRouter:
                 gps_lng=exif.get("gps_lng"),
                 album_id=album_id,
             ))
-            db.commit()
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                # W6 compensation: the bytes already reached storage; without
+                # a row the asset 404s forever and no sweeper collects the
+                # object. Remove what we just wrote, then surface the error.
+                try:
+                    gallery_delete_stored(stored_value)
+                except Exception as comp_e:
+                    logger.warning(
+                        "Gallery upload row-save failed AND object cleanup failed"
+                        " for %r (orphaned): %s", stored_value, comp_e,
+                    )
+                raise
             resp = {"ok": True, "filename": filename, "id": img_id}
             if exif.get("exif_error"):
                 resp["exif_warning"] = exif["exif_error"]
@@ -450,8 +474,9 @@ def setup_gallery_routes() -> APIRouter:
 
             content = await read_upload_limited(file, GALLERY_UPLOAD_MAX_BYTES, "Gallery replacement")
             GALLERY_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-            img_path = _gallery_image_path(img.filename)
-            img_path.write_bytes(content)
+            # Dispatches on the stored value: s3 rows overwrite the object
+            # (same key), local rows rewrite the confined file.
+            gallery_write_stored(img.filename, content)
 
             # Refresh dimensions in case the editor resized the canvas.
             # updated_at auto-bumps via TimestampMixin's onupdate hook.
@@ -525,13 +550,16 @@ def setup_gallery_routes() -> APIRouter:
             if not user or img.owner != user:
                 raise HTTPException(403, "Not your image")
 
-            img_path = _gallery_image_path(img.filename)
-            if not img_path.exists():
+            # Storage dispatch (s3 rows stream the object bytes back in;
+            # local rows read the confined file) — 404 when missing.
+            _local = gallery_local_path(img.filename)
+            if _local is not None and not _local.exists():
                 raise HTTPException(404, "Image file not found")
+            _source_bytes = gallery_read_bytes(img.filename)
 
             # PIL rotates counter-clockwise; the API takes "clockwise"
             # convention so we negate to match user expectation.
-            with Image.open(img_path) as pil:
+            with Image.open(io.BytesIO(_source_bytes)) as pil:
                 rotated = pil.rotate(-angle, expand=True)
                 # Recompute hash so dedupe stays accurate.
                 buf = BytesIO()
@@ -547,7 +575,7 @@ def setup_gallery_routes() -> APIRouter:
                     fmt = "PNG"
                 rotated.save(buf, format=fmt, **save_kwargs)
                 content = buf.getvalue()
-                img_path.write_bytes(content)
+                gallery_write_stored(img.filename, content)
                 img.file_hash = hashlib.sha256(content).hexdigest()
                 img.file_size = len(content)
                 img.width, img.height = rotated.size
@@ -646,6 +674,43 @@ def setup_gallery_routes() -> APIRouter:
         except Exception:
             logger.exception("style_transfer: request failed")
             return {"error": "Style transfer failed"}
+
+    # ---- POST /api/gallery/admin/migrate-to-backend ----
+    # One-shot migration of existing LOCAL gallery assets into the object
+    # backend (ODYSSEUS_GALLERY_STORAGE=s3). Admin-only here; the underlying
+    # src.gallery_storage.migrate_gallery_assets_to_backend is importable so
+    # `docker exec ... python -c "from src.gallery_storage import ..."` works
+    # from a shell seat without the admin password.
+    @router.post("/api/gallery/admin/migrate-to-backend")
+    async def gallery_admin_migrate_to_backend(request: Request):
+        """One-shot migration of LOCAL gallery assets to object storage.
+
+        Body (all optional): {dry_run: bool, limit: int}. Returns
+        {moved, skipped, bytes_freed, errors, orphan_files, orphan_bytes}.
+        Budget note: `limit` consumes moved+skipped — rows already on s3
+        count toward it, so small-limit re-runs can no-op once the leading
+        rows are migrated; raise or drop the limit to make progress.
+        orphan_files/bytes are local files with no row behind them: the
+        migration never moves those (no URL/ownership to preserve) —
+        review and delete manually. See migrate_gallery_assets_to_backend
+        for the per-file safety order; run in a quiet window (a failed
+        unlink leaves a stale local file shadowing the object).
+        """
+        from core.middleware import require_admin
+
+        require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        dry_run = bool(data.get("dry_run", False))
+        limit = data.get("limit")
+        if limit is not None:
+            try:
+                limit = max(0, int(limit))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "limit must be an integer")
+        return migrate_gallery_assets_to_backend(dry_run=dry_run, limit=limit)
 
     # ---- GET /api/gallery/tags ----
     @router.get("/api/gallery/tags")
@@ -829,7 +894,9 @@ def setup_gallery_routes() -> APIRouter:
                     cover_q = db.query(GalleryImage).filter(GalleryImage.id == a.cover_id)
                     cover = _owner_filter(cover_q, user).first()
                     if cover:
-                        cover_url = f"/api/generated-image/{cover.filename}"
+                        # URL uses the bare basename even for object-stored
+                        # rows (gallery_url_name), like _image_to_dict.
+                        cover_url = f"/api/generated-image/{gallery_url_name(cover.filename)}"
                 elif count > 0:
                     _cover_q = db.query(GalleryImage).filter(
                         GalleryImage.album_id == a.id, GalleryImage.is_active == True
@@ -837,7 +904,7 @@ def setup_gallery_routes() -> APIRouter:
                     _cover_q = _owner_filter(_cover_q, user)
                     first = _cover_q.order_by(GalleryImage.created_at.desc()).first()
                     if first:
-                        cover_url = f"/api/generated-image/{first.filename}"
+                        cover_url = f"/api/generated-image/{gallery_url_name(first.filename)}"
                 result.append({
                     "id": a.id, "name": a.name, "description": a.description or "",
                     "cover_url": cover_url, "count": count,
@@ -1017,11 +1084,21 @@ def setup_gallery_routes() -> APIRouter:
             used = set()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for img in imgs:
-                    src = _gallery_image_path(img.filename)
-                    if not src.exists():
-                        continue
-                    ext = src.suffix or ".png"
-                    base = (img.prompt or "").strip() or src.stem
+                    _local = gallery_local_path(img.filename)
+                    if _gallery_is_s3(img.filename):
+                        try:
+                            _content = gallery_read_bytes(img.filename)
+                        except Exception:
+                            continue
+                        _stem = gallery_url_name(img.filename).rsplit(".", 1)[0]
+                        _ext = "." + gallery_url_name(img.filename).rsplit(".", 1)[-1]
+                    else:
+                        if _local is None or not _local.exists():
+                            continue
+                        _stem, _ext = _local.stem, (_local.suffix or ".png")
+                        _content = None
+                    ext = _ext or ".png"
+                    base = (img.prompt or "").strip() or _stem
                     base = re.sub(r"[^\w\-. ]+", "", base)[:60].strip() or img.id
                     name = f"{base}{ext}"
                     i = 1
@@ -1029,7 +1106,10 @@ def setup_gallery_routes() -> APIRouter:
                         name = f"{base}-{i}{ext}"
                         i += 1
                     used.add(name)
-                    zf.write(src, arcname=name)
+                    if _content is not None:
+                        zf.writestr(name, _content)
+                    else:
+                        zf.write(_local, arcname=name)
             if not used:
                 raise HTTPException(404, "No image files found on disk")
             from fastapi import Response
@@ -1156,9 +1236,10 @@ def setup_gallery_routes() -> APIRouter:
             # already succeeded logically. Uses the path-confined resolver so a
             # malformed stored filename can't escape generated_images.
             try:
-                img_path = _gallery_image_path(img_filename)
-                if img_path.exists():
-                    img_path.unlink()
+                # Either storage shape: confined local unlink, or object
+                # delete for s3 rows. Best-effort, after the soft-delete
+                # commit — same contract as before.
+                gallery_delete_stored(img_filename)
             except Exception as e:
                 logger.warning(f"Could not remove gallery image file for {img_filename}: {e}")
 
@@ -1175,11 +1256,19 @@ def setup_gallery_routes() -> APIRouter:
                 # Match by image_id OR by filename — older messages
                 # (saved before we threaded image_id through the SSE)
                 # only carry image_url containing the filename.
+                # Migrated rows store an s3:// URI whose basename is what
+                # chat-history URLs embed (the URI contains the bare name,
+                # never the reverse) — match BOTH so old tool-event bubbles
+                # are scrubbed for local and object-stored rows alike.
+                _url_name = gallery_url_name(img_filename)
+                _match_names = [img_filename]
+                if _url_name and _url_name != img_filename:
+                    _match_names.append(_url_name)
                 msgs = db.query(_ChatMessage).filter(
                     _ChatMessage.meta_data.isnot(None),
                     _or(
                         _ChatMessage.meta_data.like(f"%{image_id}%"),
-                        _ChatMessage.meta_data.like(f"%{img_filename}%"),
+                        *[_ChatMessage.meta_data.like(f"%{n}%") for n in _match_names],
                     ),
                 ).all()
                 rows_to_delete = []
@@ -1197,8 +1286,9 @@ def setup_gallery_routes() -> APIRouter:
                         if not isinstance(ev, dict):
                             new_events.append(ev)
                             continue
-                        is_match = ev.get("image_id") == image_id or (
-                            ev.get("image_url") and img_filename in ev["image_url"]
+                        _url = ev.get("image_url") or ""
+                        is_match = ev.get("image_id") == image_id or any(
+                            n in _url for n in _match_names
                         )
                         if is_match:
                             removed_any = True
@@ -2238,14 +2328,16 @@ def setup_gallery_routes() -> APIRouter:
         try:
             img = _get_or_404_image(db, image_id, user)
 
-            img_path = _gallery_image_path(img.filename)
-            if not img_path.exists():
-                raise HTTPException(404, "Image file not found")
-
-            # Read and encode
-            img_bytes = img_path.read_bytes()
+            # Storage dispatch (s3 rows stream the object bytes back);
+            # missing local files still surface the historical 404.
+            try:
+                img_bytes = gallery_read_bytes(img.filename)
+            except HTTPException as _he:
+                if _he.status_code == 404:
+                    raise HTTPException(404, "Image file not found")
+                raise
             b64 = base64.b64encode(img_bytes).decode()
-            ext = img.filename.rsplit(".", 1)[-1].lower()
+            ext = gallery_url_name(img.filename).rsplit(".", 1)[-1].lower()
             mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                     "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/jpeg")
 
