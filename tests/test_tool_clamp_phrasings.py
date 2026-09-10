@@ -74,6 +74,27 @@ def test_person_sender_without_at_never_clamps_via_email_intent():
     assert _clamp("list mails from pietro") is False
 
 
+def test_calendar_person_sender_never_clamps_via_intent_guard():
+    """"show my calendar appointments from massimo" — the @-less person token
+    matches the named-machine regex, but the calendar intent
+    (notes_calendar_tasks) must suppress the clamp, mirroring the email
+    case: the replacing clamp would strip the calendar tools the task
+    needs."""
+    text = "show my calendar appointments from massimo"
+    intent = _classify(text)
+    assert "notes_calendar_tasks" in intent["domains"]
+    assert _looks_like_local_computer_request(text) is True  # regex-level match
+    assert _clamp(text) is False
+
+
+def test_mixed_machine_plus_calendar_request_keeps_calendar_tools():
+    """Mirrors the email mixed case: a genuine machine name plus a calendar
+    ask keeps both lanes — the clamp would strip the calendar half."""
+    text = "run the backup on nebula and add it to my calendar"
+    assert _looks_like_local_computer_request(text) is True
+    assert _clamp(text) is False
+
+
 def test_live_e2e_phrasing_full_pipeline():
     text = ("read all mails forwarded from PIETRO.PEZZULLO05@stu-mail.citytech.cuny.edu"
             " in ppezz.dev@gmail.com")

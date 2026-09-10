@@ -1189,6 +1189,12 @@ _LOCAL_COMPUTER_REFERENCE_RE = re.compile(
     # dot-containing token down to "PIETRO" and matches anyway. Rejecting
     # "<token-class>*@" kills every backtracking variant (any prefix of a
     # local-part is still followed by more local-part chars then '@').
+    # Accepted regression: user@host SSH-style phrasings ("run on
+    # root@nebula", "on pi@nebula") no longer clamp either — safe direction
+    # (no tool loss; the turn just keeps its retrieved tools).
+    # Whitespace before the @ ("from pietro @host") defeats the lookahead;
+    # the intent-domain guard in _should_clamp_to_terminus covers it
+    # whenever classification lands on email/calendar.
     r"|\b(?:on|from)\s+(?!this\b|my\b|the\b|a\b|an\b)(?:[a-z][a-z0-9_.-]{1,31})\b(?![a-z0-9_.-]*@)",
     re.IGNORECASE,
 )
@@ -1225,11 +1231,11 @@ def _should_clamp_to_terminus(
 
     Every clause is a documented regression: the workspace branch only fires
     with a bound workspace; the local-computer regex rejects email
-    local-parts ("from X@Y" is a sender, not a machine); an email intent
-    domain means retrieval/classification already committed to the email
-    tools and the REPLACING clamp must not strip them ("mails from pietro"
-    names a person, not a host — only the classifier can tell); an open
-    document/email target keeps its editing tools instead.
+    local-parts ("from X@Y" is a sender, not a machine); an email or
+    calendar intent domain means retrieval/classification already committed
+    to those tools and the REPLACING clamp must not strip them ("mails
+    from pietro" names a person, not a host — only the classifier can
+    tell); an open document/email target keeps its editing tools instead.
     """
     domains = set((intent or {}).get("domains") or set())
     return (
@@ -1242,7 +1248,12 @@ def _should_clamp_to_terminus(
         )
         and not active_document_relevant
         and not active_email
-        and "email" not in domains
+        # Email AND calendar intents keep their retrieved tools: the same
+        # @-less person-token mechanism strips either lane ("show my
+        # calendar appointments from massimo" reads "massimo" as a machine
+        # name exactly like "mails from pietro" does). The classifier's
+        # calendar key is notes_calendar_tasks.
+        and not ({"email", "notes_calendar_tasks"} & domains)
     )
 
 
