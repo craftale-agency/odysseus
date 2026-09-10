@@ -560,8 +560,11 @@ async def test_w4_chat_scrub_matches_migrated_rows(tmp_path, monkeypatch, galler
         db.add(ChatMessage(
             id="m-assistant", session_id="sess-1", role="assistant",
             content="Generated image",
+            # No image_id in the event on purpose: the scrub's bare-name
+            # clause must be the ONLY thing that can match this message
+            # (otherwise the test would pass via the image_id clause even
+            # if bare-name matching regressed).
             meta_data=_json.dumps({"tool_events": [{
-                "image_id": image_id,
                 "image_url": f"/api/generated-image/{url_name}",
             }]}),
         ))
@@ -660,3 +663,46 @@ async def test_w6_upload_row_failure_compensates_object(tmp_path, monkeypatch, g
     assert fake.objects == {}  # the stored object was removed again
     # s3 mode never touches local disk in the first place.
     assert not (tmp_path / "generated_images").exists()
+
+
+def test_migration_race_aborts_row_and_removes_stale_object(monkeypatch, tmp_path, gallery_db):
+    """S1/N3: a replace/rotate landing mid-migration aborts that row (file
+    and row stay local) AND removes the just-put pre-race object — no stale
+    copies accumulate in the bucket."""
+    fake = FakeS3Backend()
+    _use_s3(monkeypatch, fake)
+    name, path = _seed_row_with_file(gallery_db, tmp_path, b"pre-race-bytes")
+
+    real_stat = fake.stat
+
+    def _rotate_during_verify(key):
+        # The migration has read the file and put the object; simulate the
+        # race by rewriting the local file before the post-put re-stat.
+        path.write_bytes(b"post-race-rotated-bytes")
+        return real_stat(key)
+
+    fake.stat = _rotate_during_verify
+
+    summary = migrate_gallery_assets_to_backend()
+
+    assert summary["moved"] == 0
+    assert len(summary["errors"]) == 1
+    assert "changed during migration" in summary["errors"][0]["error"]
+    # Row untouched (still the bare local name), file keeps the NEW bytes...
+    assert path.read_bytes() == b"post-race-rotated-bytes"
+    db = gallery_db()
+    try:
+        from core.database import GalleryImage
+
+        row = db.query(GalleryImage).filter(GalleryImage.filename == name).first()
+        assert row is not None
+    finally:
+        db.close()
+    # ...and the pre-race object was removed again.
+    assert fake.objects == {}
+
+    # Retry in the quiet window moves the current bytes cleanly.
+    fake.stat = real_stat
+    second = migrate_gallery_assets_to_backend()
+    assert second["moved"] == 1 and second["errors"] == []
+    assert list(fake.objects.values()) == [b"post-race-rotated-bytes"]

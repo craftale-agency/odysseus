@@ -313,9 +313,10 @@ def gallery_stored_from_url_name(name: str, db) -> Optional[str]:
     compiles to a SQL LIKE with '%'-wildcards, so a name like '%25' would
     become the pattern '/%' and match the first active row of ANY owner —
     serving foreign bytes and confirming existence. Two independent
-    guards: the name must be a single safe path component (no %, _, . or
-    any other LIKE metachar survives the gallery charset), and the query
-    escapes what the charset let through anyway.
+    guards: the name must be a single safe path component in the gallery
+    charset (which already excludes '%' and every separator), and the
+    query escapes whatever metachars that charset still allows ('_' and
+    '.') via autoescape=True.
     """
     from core.database import GalleryImage
     from sqlalchemy import and_
@@ -436,6 +437,16 @@ def migrate_gallery_assets_to_backend(
                 if (stat_after.st_mtime_ns, stat_after.st_size) != (
                     stat_before.st_mtime_ns, stat_before.st_size
                 ):
+                    # The object just written holds the PRE-race bytes and
+                    # nothing references it (the row stays local) — remove
+                    # it so the bucket doesn't accumulate stale copies.
+                    try:
+                        backend.delete(key)
+                    except Exception as del_e:
+                        logger.warning(
+                            "Gallery migration: could not remove raced object"
+                            " %r (stale copy left in bucket): %s", key, del_e,
+                        )
                     summary["errors"].append({
                         "id": img.id, "filename": stored,
                         "error": "file changed during migration (size/mtime mismatch); not migrated, retry on next run",

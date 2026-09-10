@@ -252,6 +252,10 @@ def setup_upload_routes(upload_handler):
             return None
 
         db = SessionLocal()
+        # Bound up-front so the compensation in the except below can never
+        # hit a NameError when the failure happens before the store (which
+        # would swallow the real error into the cleanup log).
+        stored_value = None
         try:
             file_hash = meta.get("hash")
             if file_hash:
@@ -304,15 +308,17 @@ def setup_upload_routes(upload_handler):
             db.rollback()
             logger.warning("Failed to add chat image upload to gallery: %s", e)
             # W6 compensation: bytes already reached storage; without a row
-            # the asset 404s forever and nothing sweeps the object.
-            try:
-                from src.gallery_storage import gallery_delete_stored
-                gallery_delete_stored(stored_value)
-            except Exception as comp_e:
-                logger.warning(
-                    "Gallery object cleanup failed for %r (orphaned): %s",
-                    stored_value, comp_e,
-                )
+            # the asset 404s forever and nothing sweeps the object. Skipped
+            # when the failure predates the store (nothing to compensate).
+            if stored_value is not None:
+                try:
+                    from src.gallery_storage import gallery_delete_stored
+                    gallery_delete_stored(stored_value)
+                except Exception as comp_e:
+                    logger.warning(
+                        "Gallery object cleanup failed for %r (orphaned): %s",
+                        stored_value, comp_e,
+                    )
             return None
         finally:
             db.close()
