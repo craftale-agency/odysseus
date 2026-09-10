@@ -315,7 +315,10 @@ def test_provider_private_admin_and_cookbook_results_are_untrusted(tool_name):
     "tool_name,effect",
     [
         ("write_file", ToolEffect.WRITE_WORKSPACE),
-        ("read_email", ToolEffect.READ_PRIVATE),
+        # read_email (READ_PRIVATE) deliberately moved OFF this list —
+        # 2026-09-10 E2E: read-only email tools must pass post-external
+        # context or the email lane dead-ends; see
+        # tests/test_tool_clamp_phrasings.py for the full matrix.
         ("send_email", ToolEffect.EXTERNAL_SIDE_EFFECT),
         ("manage_settings", ToolEffect.ADMIN_CHANGE),
     ],
@@ -329,7 +332,7 @@ def test_external_context_blocks_high_impact_capabilities(tool_name, effect):
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["read_file", "grep", "web_search", "ask_user", "update_plan"],
+    ["read_file", "grep", "web_search", "ask_user", "update_plan", "read_email"],
 )
 def test_external_context_keeps_explicit_low_impact_tools_available(tool_name):
     context = ToolRunSecurityContext(external_untrusted_context_seen=True)

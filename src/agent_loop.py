@@ -1179,7 +1179,17 @@ _EXPLICIT_WORKSPACE_REFERENCE_RE = re.compile(
 _LOCAL_COMPUTER_REFERENCE_RE = re.compile(
     r"\b(?:on|from|in|using|with)\s+(?:this|my|the)\s+(?:computer|machine|pc|laptop|device|system)\b"
     r"|\b(?:local|host)\s+(?:computer|machine|files?|system)\b"
-    r"|\b(?:on|from)\s+(?!this\b|my\b|the\b|a\b|an\b)(?:[a-z][a-z0-9_.-]{1,31})\b",
+    # Named-machine alternative ("on nebula", "from pi4.local"). The trailing
+    # lookahead rejects EMAIL LOCAL-PARTS: in "read mails forwarded from
+    # PIETRO.PEZZULLO05@stu-mail..." the token "PIETRO.PEZZULLO05" is a
+    # local-part, never a hostname — and the clamp it triggered REPLACED the
+    # just-retrieved email tools with Terminus (2026-09-10 E2E: the agent
+    # improvised for 11 rounds claiming it had no email access). A plain
+    # (?!@) after the token would NOT work: the engine backtracks the
+    # dot-containing token down to "PIETRO" and matches anyway. Rejecting
+    # "<token-class>*@" kills every backtracking variant (any prefix of a
+    # local-part is still followed by more local-part chars then '@').
+    r"|\b(?:on|from)\s+(?!this\b|my\b|the\b|a\b|an\b)(?:[a-z][a-z0-9_.-]{1,31})\b(?![a-z0-9_.-]*@)",
     re.IGNORECASE,
 )
 
@@ -1202,6 +1212,38 @@ def _looks_like_workspace_coding_request(text: str) -> bool:
 def _looks_like_local_computer_request(text: str) -> bool:
     text = str(text or "")
     return bool(text.strip() and _LOCAL_COMPUTER_REFERENCE_RE.search(text))
+
+
+def _should_clamp_to_terminus(
+    workspace: Optional[str],
+    text: str,
+    intent: Optional[dict],
+    active_document_relevant: bool,
+    active_email: bool,
+) -> bool:
+    """Composed predicate for the Terminus toolset clamp ([tool-rag] flow).
+
+    Every clause is a documented regression: the workspace branch only fires
+    with a bound workspace; the local-computer regex rejects email
+    local-parts ("from X@Y" is a sender, not a machine); an email intent
+    domain means retrieval/classification already committed to the email
+    tools and the REPLACING clamp must not strip them ("mails from pietro"
+    names a person, not a host — only the classifier can tell); an open
+    document/email target keeps its editing tools instead.
+    """
+    domains = set((intent or {}).get("domains") or set())
+    return (
+        (
+            (
+                workspace
+                and _looks_like_workspace_coding_request(text)
+            )
+            or _looks_like_local_computer_request(text)
+        )
+        and not active_document_relevant
+        and not active_email
+        and "email" not in domains
+    )
 
 
 def _explicitly_references_missing_workspace(text: str, workspace: Optional[str]) -> bool:
@@ -4187,11 +4229,17 @@ async def stream_agent_loop(
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "[tool-rag] Tool index init exceeded %.1fs; falling back to always-available tools",
+                    "[tool-rag] Tool index init exceeded %.1fs; falling back to keyword tool selection",
                     _TOOL_SELECTION_TIMEOUT_SECONDS,
                 )
                 tool_idx = None
-                _relevant_tools = set(ALWAYS_AVAILABLE)
+                # Leave _relevant_tools unset so the deterministic keyword
+                # fallback below still runs — hard-coding ALWAYS_AVAILABLE
+                # here skipped the keyword hints on cold runs (embedding
+                # backend still loading its model), silently stripping
+                # email/calendar tools from queries that named them outright.
+                # Same reasoning as the retrieval-timeout branch below.
+                _relevant_tools = None
             if tool_idx:
                 if mcp_mgr:
                     try:
@@ -4268,16 +4316,12 @@ async def stream_agent_loop(
                 )
         if "ui" in (_intent.get("domains") or set()):
             _relevant_tools.add("ui_control")
-        if (
-            (
-                (
-                    workspace
-                    and _looks_like_workspace_coding_request(_retrieval_query or _last_user)
-                )
-                or _looks_like_local_computer_request(_retrieval_query or _last_user)
-            )
-            and not _active_document_relevant
-            and not active_email
+        if _should_clamp_to_terminus(
+            workspace,
+            _retrieval_query or _last_user,
+            _intent,
+            _active_document_relevant,
+            active_email,
         ):
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
             _terminus_clamped = True
