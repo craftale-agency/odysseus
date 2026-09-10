@@ -552,7 +552,21 @@ def tool_result_should_arm_gate(
 
 POST_EXTERNAL_BLOCKED_EFFECTS = frozenset(
     {
-        ToolEffect.READ_PRIVATE,
+        # READ_PRIVATE is deliberately NOT blocked here (2026-09-10 E2E,
+        # baked from the seat's verified in-container fix): read-only email
+        # tools (list_emails / read_email / search_emails) carry
+        # READ_PRIVATE, and gating them after external context meant an
+        # email run that had touched ANY untrusted content (a fetched page,
+        # a search result) could no longer list or read the mailbox the
+        # user explicitly asked about — the agent dead-ended claiming it
+        # had no email access. Every write/execute/egress/side-effect
+        # class stays gated exactly as before; only passive reads of the
+        # user's own data pass in external context. That set is wider than
+        # email: cookbook listers, resolve_contact, scan_email_unsubscribes,
+        # search_chats, list_sessions, tail_serve_output, vault_get/
+        # vault_search, and multiplexed read-actions (_PRIVATE_ACTION_READS,
+        # e.g. manage_calendar action=list) are READ_PRIVATE too — all
+        # deliberate, for the same dead-end reason.
         ToolEffect.WRITE_WORKSPACE,
         ToolEffect.WRITE_PRIVATE,
         ToolEffect.EXECUTE_CODE,
