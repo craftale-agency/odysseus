@@ -147,10 +147,45 @@ def setup_admin_wipe_routes(session_manager):
 
             if kind == "gallery":
                 count = db.query(GalleryImage).count() + db.query(GalleryAlbum).count()
+                # Object-stored rows first: collect their s3 URIs BEFORE the
+                # rows are gone, then best-effort delete the objects after the
+                # commit (a failure logs but must not abort a destructive wipe
+                # that already succeeded logically).
+                from src.storage_backend import is_s3_uri as _is_s3_uri
+
+                _s3_filenames = [
+                    row[0]
+                    for row in db.query(GalleryImage.filename).all()
+                    if _is_s3_uri(row[0])
+                ]
                 db.query(GalleryImage).delete()
                 db.query(GalleryAlbum).delete()
                 db.commit()
-                # Also drop the upload dir so disk doesn't keep orphans.
+                if _s3_filenames:
+                    from src.gallery_storage import gallery_delete_stored
+
+                    _objects_failed = 0
+                    for stored in _s3_filenames:
+                        try:
+                            gallery_delete_stored(stored)
+                        except Exception as exc:
+                            _objects_failed += 1
+                            logger.warning(
+                                "Gallery wipe: could not delete object %r: %s",
+                                stored, exc,
+                            )
+                    if _objects_failed:
+                        logger.warning(
+                            "Gallery wipe: %d object(s) could not be deleted and"
+                            " are now orphaned in the bucket", _objects_failed,
+                        )
+                # Drop the on-disk stores so disk doesn't keep orphans. The
+                # REAL asset dir is GENERATED_IMAGES_DIR (via the gallery
+                # module's seam); GALLERY_DIR/GALLERY_UPLOADS_DIR are legacy
+                # constants wiped for completeness.
+                from src.gallery_storage import _local_gallery_dir
+
+                _rmtree_quiet(str(_local_gallery_dir()))
                 _rmtree_quiet(GALLERY_DIR)
                 _rmtree_quiet(GALLERY_UPLOADS_DIR)
                 return {"status": "deleted", "kind": kind, "count": count}

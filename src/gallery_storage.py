@@ -307,15 +307,31 @@ def gallery_stored_from_url_name(name: str, db) -> Optional[str]:
     Only s3 rows match: their stored value ends with '/<name>' while local
     rows store the bare name (and were already served from disk before
     this lookup). First active match wins; None when no such row.
+
+    SECURITY: *name* arrives straight off the URL path (the serve route
+    only rejects it AFTER this lookup when nothing resolves). endswith()
+    compiles to a SQL LIKE with '%'-wildcards, so a name like '%25' would
+    become the pattern '/%' and match the first active row of ANY owner —
+    serving foreign bytes and confirming existence. Two independent
+    guards: the name must be a single safe path component (no %, _, . or
+    any other LIKE metachar survives the gallery charset), and the query
+    escapes what the charset let through anyway.
     """
     from core.database import GalleryImage
+    from sqlalchemy import and_
 
+    if not isinstance(name, str) or not _GALLERY_LOCAL_NAME_RE.fullmatch(name):
+        return None
     try:
         row = (
             db.query(GalleryImage)
             .filter(
-                GalleryImage.filename.endswith("/" + name),
-                GalleryImage.is_active == True,  # noqa: E712
+                and_(
+                    GalleryImage.filename.endswith(
+                        "/" + name, autoescape=True
+                    ),
+                    GalleryImage.is_active == True,  # noqa: E712
+                )
             )
             .first()
         )
@@ -335,12 +351,24 @@ def migrate_gallery_assets_to_backend(
 ) -> Dict[str, Any]:
     """Move EXISTING local gallery assets into the object backend.
 
-    Per-file safe order: put + verify -> update the row's filename to the
-    s3:// URI -> unlink the local file. A failed put leaves file AND row
-    untouched, so the run is idempotent and resumable (re-run skips rows
-    already migrated and retries the failures). URLs never change: the
-    object key reuses the original filename, so gallery_url_name of the
-    new value equals the old one.
+    Per-file safe order: put + verify -> re-stat the local file -> update
+    the row's filename to the s3:// URI -> unlink the local file. A failed
+    put leaves file AND row untouched, so the run is idempotent and
+    resumable (re-run skips rows already migrated and retries the
+    failures). URLs never change: the object key reuses the original
+    filename, so gallery_url_name of the new value equals the old one.
+    The re-stat guards against a replace/rotate racing the migration: if
+    the file changed (size/mtime) since it was read, that file is aborted
+    — row and file stay local, and the next run re-reads the new bytes.
+    On an unlink failure the row is already migrated: the STALE local
+    file then shadows the object on every read (local-first dispatch), so
+    run the migration in a quiet window and delete stragglers manually if
+    the summary reports unlink failures.
+
+    The summary also reports orphan local files (bytes in the gallery dir
+    with NO row behind them) — the rows-only migration cannot move them;
+    the operator decides. `limit` consumes moved+skipped budget, so
+    small-limit re-runs can no-op once the leading rows are migrated.
 
     Runnable via the admin endpoint AND via docker exec (import this
     module and call) — no auth in the function, the HTTP route gates it.
@@ -387,6 +415,7 @@ def migrate_gallery_assets_to_backend(
                 summary["skipped"] += 1
                 continue
             try:
+                stat_before = path.stat()
                 content = path.read_bytes()
                 key = _migration_key(path, stored)
                 if dry_run:
@@ -399,6 +428,19 @@ def migrate_gallery_assets_to_backend(
                     raise RuntimeError(
                         f"post-put verification failed (size {info.get('size') if isinstance(info, dict) else None} != {len(content)})"
                     )
+                # S1: a replace/rotate racing the migration would leave the
+                # object holding stale bytes and the unlink would drop the
+                # new ones — abort the file (row stays local; next run
+                # re-reads the current bytes).
+                stat_after = path.stat()
+                if (stat_after.st_mtime_ns, stat_after.st_size) != (
+                    stat_before.st_mtime_ns, stat_before.st_size
+                ):
+                    summary["errors"].append({
+                        "id": img.id, "filename": stored,
+                        "error": "file changed during migration (size/mtime mismatch); not migrated, retry on next run",
+                    })
+                    continue
             except Exception as e:
                 # File NOT unlinked, row untouched: safe to re-run.
                 summary["errors"].append({"id": img.id, "filename": stored, "error": str(e)})
@@ -406,12 +448,13 @@ def migrate_gallery_assets_to_backend(
             img.filename = backend.uri_for_key(key)
             db.commit()
             summary["moved"] += 1
-            summary["bytes_freed"] += len(content)
             try:
                 path.unlink()
+                summary["bytes_freed"] += len(content)
             except OSError as e:
+                # S2: freed-bytes only counted on a real unlink.
                 summary["errors"].append(
-                    {"id": img.id, "filename": stored, "error": f"row migrated but local unlink failed: {e}"}
+                    {"id": img.id, "filename": stored, "error": f"row migrated but local unlink failed (stale local file shadows the object until removed): {e}"}
                 )
         db.commit()
     except Exception as e:
@@ -419,6 +462,39 @@ def migrate_gallery_assets_to_backend(
         summary["errors"].append({"error": f"migration aborted: {e}"})
     finally:
         db.close()
+
+    # S3: report orphan local files — bytes in the gallery dir with NO row
+    # behind them. The rows-only migration above cannot move them (and must
+    # not: no row means no URL/ownership to preserve), but the operator
+    # needs to know what is still eating the disk.
+    summary["orphan_files"] = 0
+    summary["orphan_bytes"] = 0
+    try:
+        from core.database import GalleryImage, SessionLocal
+
+        _db = SessionLocal()
+        try:
+            _row_names = {
+                gallery_url_name(row[0])
+                for row in _db.query(GalleryImage.filename).all()
+                if row[0]
+            }
+        finally:
+            _db.close()
+        _dir = _local_gallery_dir()
+        if _dir.is_dir():
+            for _entry in _dir.iterdir():
+                if not _entry.is_file() or _entry.name.startswith("."):
+                    continue
+                if _entry.name in _row_names:
+                    continue  # a row still backs this file (local or failed)
+                summary["orphan_files"] += 1
+                try:
+                    summary["orphan_bytes"] += _entry.stat().st_size
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning("Gallery migration orphan scan failed: %s", e)
     return summary
 
 
@@ -429,8 +505,6 @@ def _migration_key(path: Path, stored: str) -> str:
     survive unchanged; the date shard uses the file's mtime so repeated
     runs target the same key.
     """
-    from src.storage_backend import S3_URI_PREFIX
-
     name = stored.rsplit("/", 1)[-1]
     try:
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)

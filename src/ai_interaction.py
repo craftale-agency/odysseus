@@ -1127,6 +1127,16 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                     return new_id
                 except Exception as _ge:
                     logger.warning(f"Failed to save gallery record: {_ge}")
+                    # W6 compensation: the image bytes were already written
+                    # to storage BEFORE this row insert; a row-less object
+                    # 404s forever and nothing sweeps it. Best-effort remove.
+                    try:
+                        from src.gallery_storage import gallery_delete_stored
+                        gallery_delete_stored(filename)
+                    except Exception as _ce:
+                        logger.warning(
+                            f"Gallery object cleanup failed for {filename!r} (orphaned): {_ce}"
+                        )
                     return ""
 
             # GPT image models always return b64_json; DALL-E may return url.
@@ -1275,6 +1285,16 @@ async def do_edit_image(
             return new_id
         except Exception as _ge:
             logger.warning("Failed to save edited image gallery record: %s", _ge)
+            # W6 compensation — see _save_to_gallery: the edited bytes were
+            # stored before this insert; remove them rather than orphaning.
+            try:
+                from src.gallery_storage import gallery_delete_stored
+                gallery_delete_stored(filename)
+            except Exception as _ce:
+                logger.warning(
+                    "Gallery object cleanup failed for %r (orphaned): %s",
+                    filename, _ce,
+                )
             return ""
 
     def _save_image_bytes(image_bytes: bytes, suffix: str = ".png") -> tuple[str, str]:

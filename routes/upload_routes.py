@@ -303,6 +303,16 @@ def setup_upload_routes(upload_handler):
         except Exception as e:
             db.rollback()
             logger.warning("Failed to add chat image upload to gallery: %s", e)
+            # W6 compensation: bytes already reached storage; without a row
+            # the asset 404s forever and nothing sweeps the object.
+            try:
+                from src.gallery_storage import gallery_delete_stored
+                gallery_delete_stored(stored_value)
+            except Exception as comp_e:
+                logger.warning(
+                    "Gallery object cleanup failed for %r (orphaned): %s",
+                    stored_value, comp_e,
+                )
             return None
         finally:
             db.close()

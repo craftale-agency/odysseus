@@ -462,3 +462,201 @@ def test_gallery_objects_flow_through_the_read_cache(monkeypatch, tmp_path):
     assert fake.get_calls.count(key) == 1
     assert gallery_read_bytes(stored) == b"cached-gallery-bytes"
     assert fake.get_calls.count(key) == 1  # served from the repopulated cache
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: W1-W6 regressions
+# ---------------------------------------------------------------------------
+
+def _route_endpoint(path: str, method: str = "POST"):
+    import routes.gallery.gallery_routes as gallery_routes
+
+    router = gallery_routes.setup_gallery_routes()
+    for r in router.routes:
+        if getattr(r, "path", None) == path and method in getattr(r, "methods", set()):
+            return gallery_routes, r.endpoint
+    raise RuntimeError(f"{method} {path} not found")
+
+
+def test_w1_album_cover_urls_use_bare_basename():
+    """Source pin (closure handlers, AST convention of the album tests):
+    both cover paths must go through gallery_url_name — a raw s3:// URI in
+    cover_url would be unresolvable."""
+    source = Path("routes/gallery/gallery_routes.py").read_text(encoding="utf-8")
+    assert 'cover_url = f"/api/generated-image/{gallery_url_name(cover.filename)}"' in source
+    assert 'cover_url = f"/api/generated-image/{gallery_url_name(first.filename)}"' in source
+    assert 'f"/api/generated-image/{cover.filename}"' not in source
+    assert 'f"/api/generated-image/{first.filename}"' not in source
+
+
+async def test_w2_ai_tag_reads_s3_rows_via_dispatch(tmp_path, monkeypatch, gallery_db):
+    """ai-tag must read object-stored rows through gallery_read_bytes; the
+    old local resolver 400'd on URIs before the vision call."""
+    fake = FakeS3Backend()
+    _use_s3(monkeypatch, fake)
+    stored, _ = gallery_store_image(b"vision-target-bytes", "png")
+    image_id = _add_gallery_row(gallery_db, stored)
+    gallery_routes, endpoint = _route_endpoint("/api/gallery/{image_id}/ai-tag")
+    monkeypatch.setattr(gallery_routes, "SessionLocal", gallery_db)
+    monkeypatch.setattr(gallery_routes, "get_current_user", lambda r: "alice")
+    monkeypatch.setattr(
+        "src.document_processor._load_vl_settings",
+        lambda: {"vision_enabled": True, "vision_model": ""},
+    )
+    def _no_model(*a, **kw):
+        raise ValueError("no vision model")
+    monkeypatch.setattr("src.document_processor._resolve_vl_model", _no_model)
+
+    from fastapi import Request
+
+    result = await endpoint(Request(scope={"type": "http"}), image_id)
+
+    # The bytes were read fine (no 400/404); the route reached the vision
+    # configuration stage and returned its operator-facing error.
+    assert "No vision model configured" in result.get("error", "")
+    assert fake.get_calls == [fake.key_for_uri(stored)]
+
+
+def test_w3_suffix_lookup_rejects_like_wildcard_names(gallery_db):
+    """W3: the serve-dispatch lookup must not turn URL garbage into a LIKE
+    pattern ('%25' -> '/%' would match the first active row of ANY owner,
+    leaking foreign bytes + an existence oracle)."""
+    stored, url_name = f"s3://{BUCKET}/gallery/2026/09/09/{'a' * 32}.png", f"{'a' * 32}.png"
+    _add_gallery_row(gallery_db, stored)
+
+    db = gallery_db()
+    try:
+        # Injection attempts resolve to nothing...
+        for attack in ("%25", "%252e%252e", "100%.png", "_", "..%2fpng", "a%25"):
+            assert gallery_stored_from_url_name(attack, db) is None, attack
+        # ...while the legitimate basename keeps resolving.
+        assert gallery_stored_from_url_name(url_name, db) == stored
+    finally:
+        db.close()
+
+
+async def test_w4_chat_scrub_matches_migrated_rows(tmp_path, monkeypatch, gallery_db):
+    """Post-delete chat-history scrub must match the BARE name for migrated
+    rows (chat events embed URL names; the URI contains it, never the
+    reverse) — otherwise old tool-event bubbles survive the delete."""
+    import json as _json
+
+    from core.database import ChatMessage, Session as DbSession
+
+    fake = FakeS3Backend()
+    _use_s3(monkeypatch, fake)
+    stored, url_name = f"s3://{BUCKET}/gallery/2026/09/09/{'b' * 32}.png", f"{'b' * 32}.png"
+    image_id = _add_gallery_row(gallery_db, stored)
+
+    db = gallery_db()
+    try:
+        db.add(DbSession(id="sess-1", name="s", endpoint_url="", model=""))
+        db.add(ChatMessage(
+            id="m-user", session_id="sess-1", role="user",
+            content="make me a picture",
+        ))
+        db.commit()
+        db.flush()
+        db.add(ChatMessage(
+            id="m-assistant", session_id="sess-1", role="assistant",
+            content="Generated image",
+            meta_data=_json.dumps({"tool_events": [{
+                "image_id": image_id,
+                "image_url": f"/api/generated-image/{url_name}",
+            }]}),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    gallery_routes, endpoint = _route_endpoint("/api/gallery/{image_id}", method="DELETE")
+    monkeypatch.setattr(gallery_routes, "SessionLocal", gallery_db)
+    monkeypatch.setattr(gallery_routes, "get_current_user", lambda r: "alice")
+
+    from fastapi import Request
+
+    result = await endpoint(Request(scope={"type": "http"}), image_id)
+    assert result["status"] == "deleted"
+
+    db = gallery_db()
+    try:
+        assert db.query(ChatMessage).filter(ChatMessage.id == "m-assistant").first() is None
+        assert db.query(ChatMessage).filter(ChatMessage.id == "m-user").first() is None
+    finally:
+        db.close()
+
+
+async def test_w5_admin_wipe_deletes_objects_and_real_dir(tmp_path, monkeypatch, gallery_db):
+    """The gallery wipe must collect s3 URIs BEFORE dropping rows and delete
+    the objects, plus rmtree the REAL asset dir (GENERATED_IMAGES_DIR seam)."""
+    fake = FakeS3Backend()
+    _use_s3(monkeypatch, fake)
+    stored, _ = gallery_store_image(b"object-bytes", "png")
+    _add_gallery_row(gallery_db, stored)  # the row the wipe must harvest
+    local_name = _seed_local_asset(tmp_path, b"local-bytes")
+
+    from core.database import GalleryAlbum
+
+    db = gallery_db()
+    try:
+        db.add(GalleryAlbum(id="album-1", name="a"))
+        db.commit()
+    finally:
+        db.close()
+
+    import routes.admin_wipe_routes as admin_wipe
+
+    monkeypatch.setattr(admin_wipe, "SessionLocal", gallery_db)
+    monkeypatch.setattr(admin_wipe, "require_admin", lambda r: None)
+
+    from fastapi import Request
+
+    router = admin_wipe.setup_admin_wipe_routes(session_manager=None)
+    handler = next(r for r in router.routes if r.path == "/api/admin/wipe/{kind}").endpoint
+    result = handler(kind="gallery", request=Request(scope={"type": "http"}))
+
+    assert result["status"] == "deleted"
+    assert not fake.exists(fake.key_for_uri(stored))  # object gone with the rows
+    assert not (tmp_path / "generated_images" / local_name).exists()  # real dir wiped
+    db = gallery_db()
+    try:
+        from core.database import GalleryImage
+
+        assert db.query(GalleryImage).count() == 0
+    finally:
+        db.close()
+
+
+async def test_w6_upload_row_failure_compensates_object(tmp_path, monkeypatch, gallery_db):
+    """Bytes reach storage BEFORE the row insert; if the commit fails the
+    object must be deleted again (row-less objects 404 forever and nothing
+    sweeps them)."""
+    fake = FakeS3Backend()
+    _use_s3(monkeypatch, fake)
+
+    gallery_routes, endpoint = _route_endpoint("/api/gallery/upload")
+    monkeypatch.setattr(gallery_routes, "SessionLocal", gallery_db)
+    monkeypatch.setattr(gallery_routes, "get_current_user", lambda r: "alice")
+
+    class _CommitFails(gallery_db().__class__):
+        def commit(self):
+            raise RuntimeError("simulated DB commit failure")
+
+    _fail_factory = _CommitFails  # noqa: F841 — clarity
+    monkeypatch.setattr(gallery_routes, "SessionLocal", _CommitFails)
+
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(gallery_routes.setup_gallery_routes())
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/gallery/upload",
+        files={"file": ("photo.png", b"compensated-bytes", "image/png")},
+    )
+
+    assert response.status_code == 500
+    assert fake.objects == {}  # the stored object was removed again
+    # s3 mode never touches local disk in the first place.
+    assert not (tmp_path / "generated_images").exists()
