@@ -133,5 +133,14 @@ def test_gallery_file_operations_use_confining_resolver():
     assert 'Path("data/generated_images") / img.filename' not in source
     assert 'os.path.join("data", "generated_images", img.filename)' not in source
     assert 'os.path.join("data", "generated_images", img_filename)' not in source
-    assert source.count("_gallery_image_path(img.filename)") >= 3
-    assert "_gallery_image_path(img_filename)" in source
+    # File operations resolve through the confining resolvers: the routes
+    # resolver (_gallery_image_path) and the storage-dispatch twin
+    # (gallery_local_path, src/gallery_storage.py) that backs s3 rows.
+    confined_calls = (
+        source.count("_gallery_image_path(img.filename)")
+        + source.count("gallery_local_path(img.filename)")
+    )
+    assert confined_calls >= 3
+    # Delete routes through the storage dispatch, which confines local
+    # names via gallery_local_path (same charset + realpath containment).
+    assert "gallery_delete_stored(img_filename)" in source

@@ -101,20 +101,36 @@ def cleanup_session_images(session_id: str, db=None) -> int:
 
         images = query.all()
         removed = 0
+        from src.storage_backend import is_s3_uri as _is_s3_uri
+
         for img in images:
             img.is_active = False
             if img.filename:
-                path = _generated_image_path_for_cleanup(img.filename)
-                if path and path.exists():
+                if _is_s3_uri(img.filename):
+                    # Object-stored gallery asset: remove the object too
+                    # (best-effort, same as the local unlink below).
                     try:
-                        path.unlink()
+                        from src.gallery_storage import gallery_delete_stored
+                        gallery_delete_stored(img.filename)
                     except Exception as exc:
                         logger.warning(
-                            "Could not remove generated image %s for deleted session %s: %s",
+                            "Could not remove gallery object %s for deleted session %s: %s",
                             img.filename,
                             session_id,
                             exc,
                         )
+                else:
+                    path = _generated_image_path_for_cleanup(img.filename)
+                    if path and path.exists():
+                        try:
+                            path.unlink()
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not remove generated image %s for deleted session %s: %s",
+                                img.filename,
+                                session_id,
+                                exc,
+                            )
             removed += 1
 
         if owns_db and images:

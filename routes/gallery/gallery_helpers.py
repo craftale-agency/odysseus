@@ -94,10 +94,15 @@ def _extract_exif(content: bytes) -> dict:
 # ---- Helpers ----
 
 def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any]:
+    from src.gallery_storage import gallery_url_name
+
     return {
         "id": img.id,
         "filename": img.filename,
-        "url": f"/api/generated-image/{img.filename}",
+        # s3-backed rows store an s3:// URI in `filename`; URLs always use
+        # the bare basename so the frontend + chat-history references stay
+        # identical across a storage flip or migration.
+        "url": f"/api/generated-image/{gallery_url_name(img.filename)}",
         "prompt": img.prompt,
         "caption": img.caption or "",
         "model": img.model,

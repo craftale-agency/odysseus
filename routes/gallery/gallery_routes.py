@@ -228,6 +228,18 @@ def _sanitize_gallery_filename(filename: str) -> str:
 
 GALLERY_IMAGE_DIR = Path(GENERATED_IMAGES_DIR)
 
+# Storage-backend dispatch for gallery assets (ODYSSEUS_GALLERY_STORAGE).
+from src.gallery_storage import (  # noqa: E402
+    gallery_delete_stored,
+    gallery_local_path,
+    gallery_read_bytes,
+    gallery_store_image,
+    gallery_url_name,
+    gallery_write_stored,
+    migrate_gallery_assets_to_backend,
+)
+from src.storage_backend import is_s3_uri as _gallery_is_s3
+
 
 def _gallery_image_path(filename: str) -> Path:
     """Resolve a stored gallery filename without leaving generated_images."""
@@ -394,9 +406,10 @@ def setup_gallery_routes() -> APIRouter:
             if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
                 raise HTTPException(400, f"Unsupported file type: .{ext}")
             is_video = ext in VIDEO_EXTS
-            filename = f"{uuid.uuid4().hex[:12]}.{ext}"
-            img_path = img_dir / filename
-            img_path.write_bytes(content)
+            # Storage dispatch (ODYSSEUS_GALLERY_STORAGE): object-stored rows
+            # keep an s3:// URI in `filename`; local rows keep the bare name.
+            # `filename` below stays the URL-facing bare name either way.
+            stored_value, filename = gallery_store_image(content, ext)
 
             # Extract EXIF for images only — PIL can't parse video containers
             # and the failure path logs a noisy WARNING. We'll add ffprobe-based
@@ -407,7 +420,7 @@ def setup_gallery_routes() -> APIRouter:
             img_id = str(uuid.uuid4())
             db.add(GalleryImage(
                 id=img_id,
-                filename=filename,
+                filename=stored_value,
                 prompt=original_name,
                 model="imported",
                 owner=user,
@@ -450,8 +463,9 @@ def setup_gallery_routes() -> APIRouter:
 
             content = await read_upload_limited(file, GALLERY_UPLOAD_MAX_BYTES, "Gallery replacement")
             GALLERY_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-            img_path = _gallery_image_path(img.filename)
-            img_path.write_bytes(content)
+            # Dispatches on the stored value: s3 rows overwrite the object
+            # (same key), local rows rewrite the confined file.
+            gallery_write_stored(img.filename, content)
 
             # Refresh dimensions in case the editor resized the canvas.
             # updated_at auto-bumps via TimestampMixin's onupdate hook.
@@ -525,13 +539,16 @@ def setup_gallery_routes() -> APIRouter:
             if not user or img.owner != user:
                 raise HTTPException(403, "Not your image")
 
-            img_path = _gallery_image_path(img.filename)
-            if not img_path.exists():
+            # Storage dispatch (s3 rows stream the object bytes back in;
+            # local rows read the confined file) — 404 when missing.
+            _local = gallery_local_path(img.filename)
+            if _local is not None and not _local.exists():
                 raise HTTPException(404, "Image file not found")
+            _source_bytes = gallery_read_bytes(img.filename)
 
             # PIL rotates counter-clockwise; the API takes "clockwise"
             # convention so we negate to match user expectation.
-            with Image.open(img_path) as pil:
+            with Image.open(io.BytesIO(_source_bytes)) as pil:
                 rotated = pil.rotate(-angle, expand=True)
                 # Recompute hash so dedupe stays accurate.
                 buf = BytesIO()
@@ -547,7 +564,7 @@ def setup_gallery_routes() -> APIRouter:
                     fmt = "PNG"
                 rotated.save(buf, format=fmt, **save_kwargs)
                 content = buf.getvalue()
-                img_path.write_bytes(content)
+                gallery_write_stored(img.filename, content)
                 img.file_hash = hashlib.sha256(content).hexdigest()
                 img.file_size = len(content)
                 img.width, img.height = rotated.size
@@ -646,6 +663,30 @@ def setup_gallery_routes() -> APIRouter:
         except Exception:
             logger.exception("style_transfer: request failed")
             return {"error": "Style transfer failed"}
+
+    # ---- POST /api/gallery/admin/migrate-to-backend ----
+    # One-shot migration of existing LOCAL gallery assets into the object
+    # backend (ODYSSEUS_GALLERY_STORAGE=s3). Admin-only here; the underlying
+    # src.gallery_storage.migrate_gallery_assets_to_backend is importable so
+    # `docker exec ... python -c "from src.gallery_storage import ..."` works
+    # from a shell seat without the admin password.
+    @router.post("/api/gallery/admin/migrate-to-backend")
+    async def gallery_admin_migrate_to_backend(request: Request):
+        from core.middleware import require_admin
+
+        require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        dry_run = bool(data.get("dry_run", False))
+        limit = data.get("limit")
+        if limit is not None:
+            try:
+                limit = max(0, int(limit))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "limit must be an integer")
+        return migrate_gallery_assets_to_backend(dry_run=dry_run, limit=limit)
 
     # ---- GET /api/gallery/tags ----
     @router.get("/api/gallery/tags")
@@ -1017,11 +1058,21 @@ def setup_gallery_routes() -> APIRouter:
             used = set()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for img in imgs:
-                    src = _gallery_image_path(img.filename)
-                    if not src.exists():
-                        continue
-                    ext = src.suffix or ".png"
-                    base = (img.prompt or "").strip() or src.stem
+                    _local = gallery_local_path(img.filename)
+                    if _gallery_is_s3(img.filename):
+                        try:
+                            _content = gallery_read_bytes(img.filename)
+                        except Exception:
+                            continue
+                        _stem = gallery_url_name(img.filename).rsplit(".", 1)[0]
+                        _ext = "." + gallery_url_name(img.filename).rsplit(".", 1)[-1]
+                    else:
+                        if _local is None or not _local.exists():
+                            continue
+                        _stem, _ext = _local.stem, (_local.suffix or ".png")
+                        _content = None
+                    ext = _ext or ".png"
+                    base = (img.prompt or "").strip() or _stem
                     base = re.sub(r"[^\w\-. ]+", "", base)[:60].strip() or img.id
                     name = f"{base}{ext}"
                     i = 1
@@ -1029,7 +1080,10 @@ def setup_gallery_routes() -> APIRouter:
                         name = f"{base}-{i}{ext}"
                         i += 1
                     used.add(name)
-                    zf.write(src, arcname=name)
+                    if _content is not None:
+                        zf.writestr(name, _content)
+                    else:
+                        zf.write(_local, arcname=name)
             if not used:
                 raise HTTPException(404, "No image files found on disk")
             from fastapi import Response
@@ -1156,9 +1210,10 @@ def setup_gallery_routes() -> APIRouter:
             # already succeeded logically. Uses the path-confined resolver so a
             # malformed stored filename can't escape generated_images.
             try:
-                img_path = _gallery_image_path(img_filename)
-                if img_path.exists():
-                    img_path.unlink()
+                # Either storage shape: confined local unlink, or object
+                # delete for s3 rows. Best-effort, after the soft-delete
+                # commit — same contract as before.
+                gallery_delete_stored(img_filename)
             except Exception as e:
                 logger.warning(f"Could not remove gallery image file for {img_filename}: {e}")
 

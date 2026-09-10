@@ -68,6 +68,12 @@ services:
       # when unset/empty.
       - ODYSSEUS_S3_CACHE_DIR=${ODYSSEUS_S3_CACHE_DIR:-}
       - ODYSSEUS_S3_CACHE_MAX_BYTES=${ODYSSEUS_S3_CACHE_MAX_BYTES:-}
+      # Opt-in object storage for GALLERY assets (src/gallery_storage.py).
+      # "local" (default) keeps gallery files on the data volume — main
+      # instances stay byte-identical; "s3" stores new assets (and any
+      # migrated ones) in MinIO under gallery/YYYY/MM/DD/ keys, for hosts
+      # where the local disk cannot keep up (e.g. Odypezzus on nebula).
+      - ODYSSEUS_GALLERY_STORAGE=${ODYSSEUS_GALLERY_STORAGE:-local}
       # Comma-separated list of proxy hostnames that front an Ollama
       # OpenAI-compat /v1 endpoint (e.g. langfuse-openai-proxy via Cloudflare
       # Tunnel). When set, Odysseus forwards `think: false` to thinking models

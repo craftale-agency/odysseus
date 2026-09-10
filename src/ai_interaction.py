@@ -1129,15 +1129,17 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                     logger.warning(f"Failed to save gallery record: {_ge}")
                     return ""
 
-            # GPT image models always return b64_json; DALL-E may return url
+            # GPT image models always return b64_json; DALL-E may return url.
+            # Storage dispatch (ODYSSEUS_GALLERY_STORAGE): stored_value is an
+            # s3:// URI when armed, the bare filename otherwise; URLs always
+            # use the bare name.
             if img.get("b64_json"):
-                img_dir = Path(GENERATED_IMAGES_DIR)
-                img_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"{uuid.uuid4().hex[:12]}.png"
-                img_path = img_dir / filename
-                img_path.write_bytes(base64.b64decode(img.get("b64_json")))
+                from src.gallery_storage import gallery_store_image
+                stored_value, filename = gallery_store_image(
+                    base64.b64decode(img.get("b64_json")), "png"
+                )
                 image_url = f"/api/generated-image/{filename}"
-                image_id = _save_to_gallery(filename)
+                image_id = _save_to_gallery(stored_value)
 
             elif img.get("url"):
                 # Download external URL and save locally (DALL-E returns temp URLs)
@@ -1151,13 +1153,12 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                 try:
                     dl_resp = httpx.get(result_url, timeout=60)
                     if dl_resp.status_code == 200:
-                        img_dir = Path(GENERATED_IMAGES_DIR)
-                        img_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"{uuid.uuid4().hex[:12]}.png"
-                        img_path = img_dir / filename
-                        img_path.write_bytes(dl_resp.content)
+                        from src.gallery_storage import gallery_store_image
+                        stored_value, filename = gallery_store_image(
+                            dl_resp.content, "png"
+                        )
                         image_url = f"/api/generated-image/{filename}"
-                        image_id = _save_to_gallery(filename)
+                        image_id = _save_to_gallery(stored_value)
                     else:
                         image_url = result_url  # fallback to external URL
                 except Exception as _dl_e:
@@ -1277,11 +1278,10 @@ async def do_edit_image(
             return ""
 
     def _save_image_bytes(image_bytes: bytes, suffix: str = ".png") -> tuple[str, str]:
-        img_dir = Path(GENERATED_IMAGES_DIR)
-        img_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{uuid.uuid4().hex[:12]}{suffix}"
-        (img_dir / filename).write_bytes(image_bytes)
-        return f"/api/generated-image/{filename}", _save_edited_image_to_gallery(filename)
+        from src.gallery_storage import gallery_store_image
+
+        stored_value, filename = gallery_store_image(image_bytes, suffix.lstrip("."))
+        return f"/api/generated-image/{filename}", _save_edited_image_to_gallery(stored_value)
 
     async def _try_local_img2img_fallback(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         """Try Odysseus' local diffusion img2img endpoint.

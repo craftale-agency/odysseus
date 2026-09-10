@@ -47,6 +47,11 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     # is actionable straight from the container logs. No silent local fallback.
     validate_storage_backend_at_boot()
 
+    # Same fail-fast for the gallery object-storage lane (no-op unless
+    # ODYSSEUS_GALLERY_STORAGE=s3).
+    from src.gallery_storage import validate_gallery_storage_at_boot
+    validate_gallery_storage_at_boot()
+
     # Create directories first
     create_directories()
 

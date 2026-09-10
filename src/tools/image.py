@@ -49,8 +49,9 @@ async def do_edit_image(content: str, owner: Optional[str] = None) -> Dict:
                             q = q.filter(GalleryImage.owner == owner)
                         img = q.first()
                         if img and img.filename:
+                            from src.gallery_storage import gallery_url_name
                             result.update({
-                                "image_url": f"/api/generated-image/{img.filename}",
+                                "image_url": f"/api/generated-image/{gallery_url_name(img.filename)}",
                                 "image_prompt": img.prompt or args.get("prompt") or action,
                                 "image_model": img.model or "edit_image",
                                 "image_size": img.size or "",
