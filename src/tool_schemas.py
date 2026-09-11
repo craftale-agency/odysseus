@@ -593,14 +593,15 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_calendar",
-            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
+            "description": "Manage calendar events: list events in a date range, create, update, delete. ALWAYS pass an explicit action (required; an action-less payload defaults to list_events). Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
                                "enum": ["list_events", "create_event", "update_event", "delete_event", "list_calendars"],
-                               "description": "Action to perform"},
+                               "description": "REQUIRED on every call — never omit it. A payload without action is treated as list_events and create fields are ignored."},
                     "summary": {"type": "string", "description": "Event title (for create/update)"},
+                    "allow_duplicate": {"type": "boolean", "description": "create_event: set true to create even when a similar event (same summary, overlapping time, same calendar) already exists. Default false returns 'A similar event already exists ...' without creating."},
                     "dtstart": {"type": "string", "description": "Start ISO datetime, or YYYY-MM-DD if all_day"},
                     "dtend": {"type": "string", "description": "End ISO datetime; defaults to +1h (or +1 day for all_day)"},
                     "all_day": {"type": "boolean", "description": "Whether this is an all-day event"},
