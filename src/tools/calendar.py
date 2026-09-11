@@ -77,7 +77,31 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
     # cosmetic typo back to the model and waste a round-trip. Also accept
     # short forms (`create`, `update`, `delete`) as aliases for the
     # full `<verb>_event` names — models keep emitting the short forms.
-    action = (args.get("action") or "list_events").replace("-", "_").strip().lower()
+    raw_action = str(args.get("action") or "").strip()
+    if not raw_action:
+        # Missing/whitespace action. Defaulting EVERYTHING to list_events
+        # sent create-shaped payloads down the list path, whose "No events
+        # between ..." answer made the model believe creation was silently
+        # failing — a 15-round format-roulette spiral (2026-09-10 live
+        # transcript, qwen3.5:9b). Create-shaped payloads now get a LOUD,
+        # actionable error; genuinely list-shaped payloads (explicit
+        # range keys, or no args at all) keep the silent list default —
+        # models legitimately emit action-less {"start","end"} queries.
+        create_shaped = any(
+            args.get(k) not in (None, "") for k in ("summary", "dtstart", "description")
+        )
+        if create_shaped:
+            return {
+                "error": (
+                    "manage_calendar requires an explicit 'action'. Your payload"
+                    " looks like a create — add \"action\": \"create_event\"."
+                    " Valid actions: list_events, create_event, update_event,"
+                    " delete_event, list_calendars"
+                ),
+                "exit_code": 1,
+            }
+        raw_action = "list_events"
+    action = raw_action.replace("-", "_").lower()
     _ACTION_ALIASES = {
         "create": "create_event",
         "update": "update_event",
@@ -358,21 +382,33 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
                 else:
                     dtend = dtstart + timedelta(hours=1)
 
-            # Dedup: if a non-cancelled event with the same title + start time already
-            # exists, return its UID instead of creating a fresh copy. Prevents the
-            # email triage from multiplying events when several emails reference the
-            # same meeting. Compare case-insensitively since LLM-extracted titles
-            # can vary in capitalisation.
+            # Duplicate guard: a non-cancelled event in the TARGET calendar
+            # with the same summary (case-insensitive) whose time range
+            # overlaps this one blocks the create. The previous exact-dtstart
+            # comparison let shifted-by-minutes duplicates through, and both
+            # halves of a retry loop (model re-sending after a lost response,
+            # or "fixing" a create that never visibly landed) multiplied
+            # events until the user asked for a destructive cleanup
+            # (2026-09-10 live incident). The response mirrors the exact-
+            # approval idiom: nothing was created, and the caller can force
+            # the duplicate explicitly with allow_duplicate=true.
             from sqlalchemy import func as _func
-            existing = (
-                _event_query()
-                .filter(
-                    CalendarEvent.dtstart == dtstart,
-                    CalendarEvent.status != "cancelled",
-                    _func.lower(CalendarEvent.summary) == summary.lower(),
-                )
-                .first()
+            allow_duplicate = str(args.get("allow_duplicate") or "").strip().lower() in (
+                "1", "true", "yes", "on",
             )
+            existing = None
+            if not allow_duplicate:
+                existing = (
+                    _event_query()
+                    .filter(
+                        CalendarCal.id == cal.id,
+                        CalendarEvent.dtstart < dtend,
+                        CalendarEvent.dtend > dtstart,
+                        CalendarEvent.status != "cancelled",
+                        _func.lower(CalendarEvent.summary) == summary.lower(),
+                    )
+                    .first()
+                )
             if existing is not None:
                 reminder_note_id = None
                 reminder_skipped_reason = None
@@ -397,13 +433,16 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
                     )
                 return {
                     "response": (
-                        f"Event already exists: '{summary}' on {dtstart_str}"
+                        f"A similar event already exists: '{existing.summary}' at"
+                        f" {existing.dtstart.isoformat()}. Send again with"
+                        " allow_duplicate=true to create anyway."
                         + reminder_text
                     ),
                     "uid": existing.uid,
                     "reminder_note_id": reminder_note_id,
                     "reminder_skipped_reason": reminder_skipped_reason,
                     "duplicate": True,
+                    "approval_required": True,
                     "exit_code": 0,
                 }
 
