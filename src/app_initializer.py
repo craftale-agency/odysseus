@@ -70,6 +70,17 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     Returns:
         Dictionary containing all initialized components
     """
+    # Storage/gallery boot validation MUST run before anything touches the
+    # filesystem: backend=s3 with missing S3 env, a garbage cache cap, or a
+    # gallery cache dir inside UPLOAD_DIR all refuse to start HERE instead
+    # of degrading silently at first use. (Restore of wiring the 2026-09-12
+    # upstream-security merge silently dropped — pinned by
+    # tests/test_boot_validation_wiring.py.)
+    from src.storage_backend import validate_storage_backend_at_boot
+    from src.gallery_storage import validate_gallery_storage_at_boot
+    validate_storage_backend_at_boot()
+    validate_gallery_storage_at_boot()
+
     # Create directories first
     create_directories()
 
