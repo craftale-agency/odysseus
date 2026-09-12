@@ -3,8 +3,8 @@ import json
 import os
 import re
 import difflib
-import fnmatch
 import shutil
+import time
 from typing import Optional, Dict, Any, Tuple, List
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
@@ -407,7 +407,11 @@ def _apply_patch_hunks(original: str, hunks: List[List[str]], label: str) -> str
 
 class LsTool:
     async def execute(self, content: str, ctx: dict) -> dict:
-        from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
+        from src.tool_execution import (
+            _is_denied_tool_path,
+            _resolve_search_root,
+            _truncate,
+        )
         raw_path = ""
         _s = (content or "").strip()
         if _s.startswith("{"):
@@ -430,6 +434,8 @@ class LsTool:
                 with os.scandir(root) as it:
                     for entry in it:
                         if entry.name.startswith("."):
+                            continue
+                        if _is_denied_tool_path(os.path.realpath(entry.path)):
                             continue
                         try:
                             is_dir = entry.is_dir(follow_symlinks=False)
@@ -458,7 +464,8 @@ class GlobTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import (
             _SENSITIVE_BASENAMES,
-            _is_sensitive_path,
+            _can_traverse_tool_path,
+            _is_denied_tool_path,
             _resolve_tool_path,
             _resolve_search_root,
             _truncate,
@@ -507,7 +514,7 @@ class GlobTool:
                 # .ssh/id_rsa, …) falls through to the walk, which skips it —
                 # otherwise glob would surface secret paths that read_file /
                 # grep already refuse to touch.
-                if inside and os.path.exists(cand) and not _is_sensitive_path(cand):
+                if inside and os.path.exists(cand) and not _is_denied_tool_path(cand):
                     return [cand], None
                 # Literal not at exact path — fall through to walk so
                 # e.g. "foo.py" still matches at any depth (like rglob).
@@ -517,13 +524,18 @@ class GlobTool:
             cap = _CODENAV_MAX_HITS * 5
             try:
                 for dp, dns, fns in os.walk(base):
+                    if not _can_traverse_tool_path(os.path.realpath(dp)):
+                        dns[:] = []
+                        continue
                     # Prune skipped dirs before descending (unlike rglob which
                     # descends first then filters — fatal on large node_modules).
                     # Sensitive dirs (.ssh, .gnupg, …) are pruned too so glob
                     # never enumerates the keys/tokens inside them.
                     dns[:] = [
                         d for d in dns
-                        if d not in _CODENAV_SKIP_DIRS and d not in _SENSITIVE_BASENAMES
+                        if d not in _CODENAV_SKIP_DIRS
+                        and d not in _SENSITIVE_BASENAMES
+                        and _can_traverse_tool_path(os.path.realpath(os.path.join(dp, d)))
                     ]
                     for name in fns + dns:
                         full = os.path.join(dp, name)
@@ -531,7 +543,7 @@ class GlobTool:
                         if regex.fullmatch(rel) or regex.fullmatch(name):
                             # Skip deny-listed sensitive files (.env, id_rsa,
                             # known_hosts, …) the same way grep does.
-                            if _is_sensitive_path(os.path.realpath(full)):
+                            if _is_denied_tool_path(os.path.realpath(full)):
                                 continue
                             try:
                                 mtime = os.stat(full).st_mtime
@@ -559,7 +571,10 @@ class GrepTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import (
             _SENSITIVE_FILE_PATTERNS,
-            _is_sensitive_path,
+            _agent_readable_data_subdirs,
+            _can_traverse_tool_path,
+            _is_denied_tool_path,
+            _path_within,
             _resolve_tool_path,
             _resolve_search_root,
             _truncate,
@@ -592,50 +607,178 @@ class GrepTool:
             import re as _re
             import shutil
             rg = shutil.which("rg")
+            from src.constants import DATA_DIR
+            real_root = os.path.realpath(root)
+            data_dir = os.path.realpath(DATA_DIR)
+            spans_state = _path_within(data_dir, real_root)
+            if spans_state and not rg:
+                return None, "grep: ripgrep is required when the search root contains application state"
             if rg:
-                cmd = [rg, "--line-number", "--no-heading", "--color=never",
-                       "--max-count", str(max_hits)]
-                if ignore_case:
-                    cmd.append("--ignore-case")
-                if glob_pat:
-                    cmd += ["--glob", glob_pat]
-                # --iglob (not --glob) so the exclusion is case-insensitive:
-                # on a case-insensitive filesystem "ID_RSA"/"Known_Hosts"
-                # resolve to the same secret as their lowercase forms, and the
-                # Python fallback below already folds case via _is_sensitive_path.
-                for _pat in _SENSITIVE_FILE_PATTERNS:
-                    cmd += ["--iglob", f"!*{_pat}*"]
-                for _d in _CODENAV_SKIP_DIRS:
-                    cmd += ["--glob", f"!**/{_d}/**"]
-                cmd += ["--regexp", pattern, root]
-                try:
-                    import subprocess
-                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-                    lines = [ln for ln in (p.stdout or "").splitlines() if ln][:max_hits]
-                    return lines, None
-                except subprocess.TimeoutExpired:
-                    return None, "grep: timed out"
-                except Exception as _e:
-                    return None, f"grep: {_e}"
+                searches: list[tuple[str, list[str]]] = [(real_root, [])]
+                if spans_state:
+                    searches = []
+                    # Search everything outside DATA_DIR with a native rg glob
+                    # exclusion.  Search validated carve-outs separately so
+                    # their contents remain available without exposing state
+                    # siblings.  --no-follow prevents a symlink from bypassing
+                    # the excluded canonical subtree.
+                    if real_root != data_dir:
+                        rel_data = os.path.relpath(data_dir, real_root).replace(
+                            os.sep, "/"
+                        )
+                        searches.append(
+                            (real_root, [f"!{rel_data}", f"!{rel_data}/**"])
+                        )
+                    seen_roots: set[str] = set()
+                    for readable in _agent_readable_data_subdirs():
+                        if not _path_within(
+                            readable, real_root
+                        ) or not os.path.exists(readable):
+                            continue
+                        canonical = os.path.realpath(readable)
+                        if canonical not in seen_roots:
+                            seen_roots.add(canonical)
+                            searches.append((canonical, []))
+
+                lines: list[str] = []
+                deadline = time.monotonic() + 20
+                for search_root, state_excludes in searches:
+                    remaining_hits = max_hits - len(lines)
+                    if remaining_hits <= 0:
+                        break
+                    # JSON output gives us the canonical match pathname so it
+                    # can be revalidated before any line reaches the model.
+                    # This is required for hardlink aliases inside an allowed
+                    # workspace; lexical/path checks alone cannot see them.
+                    cmd = [
+                        rg, "--json", "--no-config", "--no-follow",
+                        "--max-count", str(remaining_hits),
+                    ]
+                    if ignore_case:
+                        cmd.append("--ignore-case")
+                    if glob_pat:
+                        cmd += ["--glob", glob_pat]
+                    # --iglob (not --glob) so the exclusion is case-insensitive:
+                    # on a case-insensitive filesystem "ID_RSA"/"Known_Hosts"
+                    # resolve to the same secret as their lowercase forms.
+                    for _pat in _SENSITIVE_FILE_PATTERNS:
+                        cmd += ["--iglob", f"!*{_pat}*"]
+                    for _d in _CODENAV_SKIP_DIRS:
+                        cmd += ["--glob", f"!**/{_d}/**"]
+                    for exclusion in state_excludes:
+                        cmd += ["--glob", exclusion]
+                    cmd += ["--regexp", pattern, search_root]
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        return None, "grep: timed out"
+                    try:
+                        import queue
+                        import subprocess
+                        import threading
+                        process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            bufsize=1,
+                        )
+                    except Exception as _e:
+                        return None, f"grep: {_e}"
+                    output: queue.Queue[Optional[str]] = queue.Queue()
+
+                    def _read_stdout() -> None:
+                        assert process.stdout is not None
+                        try:
+                            for line in process.stdout:
+                                output.put(line.rstrip("\n"))
+                        finally:
+                            output.put(None)
+
+                    threading.Thread(target=_read_stdout, daemon=True).start()
+                    try:
+                        while len(lines) < max_hits:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                return None, "grep: timed out"
+                            try:
+                                line = output.get(timeout=remaining)
+                            except queue.Empty:
+                                return None, "grep: timed out"
+                            if line is None:
+                                break
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except (TypeError, json.JSONDecodeError):
+                                # Keep lightweight/fake runners compatible with
+                                # the historical plain `path:line:text` stream;
+                                # still revalidate the path before exposing it.
+                                pieces = line.split(":", 2)
+                                if len(pieces) >= 3:
+                                    plain_path = pieces[0]
+                                    if not _is_denied_tool_path(os.path.realpath(plain_path)):
+                                        if line not in lines:
+                                            lines.append(line)
+                                continue
+                            if event.get("type") != "match":
+                                continue
+                            match = event.get("data") or {}
+                            path_data = match.get("path") or {}
+                            match_path = path_data.get("text")
+                            if not match_path:
+                                continue
+                            if _is_denied_tool_path(os.path.realpath(match_path)):
+                                continue
+                            line_text = (match.get("lines") or {}).get("text", "")
+                            line_number = match.get("line_number", "?")
+                            rendered = (
+                                f"{match_path}:{line_number}:"
+                                f"{line_text.rstrip()[:_CODENAV_MAX_LINE]}"
+                            )
+                            if rendered not in lines:
+                                lines.append(rendered)
+                    finally:
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=1)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
+                return lines, None
             try:
                 rx = _re.compile(pattern, _re.IGNORECASE if ignore_case else 0)
             except _re.error as _e:
                 return None, f"grep: bad pattern: {_e}"
+            glob_rx = _glob_to_regex(glob_pat.replace("\\", "/")) if glob_pat else None
             hits = []
             if os.path.isfile(root):
                 file_iter = [root]
             else:
                 file_iter = []
                 for dp, dns, fns in os.walk(root):
-                    dns[:] = [d for d in dns if d not in _CODENAV_SKIP_DIRS]
+                    if not _can_traverse_tool_path(os.path.realpath(dp)):
+                        dns[:] = []
+                        continue
+                    dns[:] = [
+                        d for d in dns
+                        if d not in _CODENAV_SKIP_DIRS
+                        and _can_traverse_tool_path(os.path.realpath(os.path.join(dp, d)))
+                    ]
                     for fn in fns:
-                        if glob_pat and not fnmatch.fnmatch(fn, glob_pat):
+                        rel = os.path.relpath(os.path.join(dp, fn), root).replace(
+                            os.sep, "/"
+                        )
+                        if glob_rx and not (
+                            glob_rx.fullmatch(rel) or glob_rx.fullmatch(fn)
+                        ):
                             continue
                         file_iter.append(os.path.join(dp, fn))
             for fp in file_iter:
                 if len(hits) >= max_hits:
                     break
-                if _is_sensitive_path(os.path.realpath(fp)):
+                if _is_denied_tool_path(os.path.realpath(fp)):
                     continue
                 try:
                     with open(fp, "r", encoding="utf-8", errors="strict") as f:
