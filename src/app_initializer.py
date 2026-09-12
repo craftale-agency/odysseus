@@ -24,7 +24,6 @@ from src.research_handler import ResearchHandler
 from src.upload_handler import UploadHandler
 from src.tool_utils import set_upload_handler
 from src.search import update_search_config
-from src.storage_backend import validate_storage_backend_at_boot
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +35,13 @@ def create_directories():
     # The model-controlled workspace must be a real child of DATA_DIR.  Never
     # follow a pre-existing symlink here: it would silently move the default
     # native-file root outside the application volume before any resolver runs.
-    data_root = os.path.realpath(os.path.abspath(os.path.expanduser(DATA_DIR)))
+    data_root = os.path.realpath(DATA_DIR)
     workspace = os.path.abspath(os.path.expanduser(AGENT_WORKSPACE_DIR))
-    expected_workspace = os.path.join(data_root, "agent_workspace")
-    # Validate the real parent so a supported DATA_DIR bind/symlink works, but
-    # require the fixed internal carve-out name and reject a link at the model-
-    # controlled workspace entry itself.
-    if (
-        os.path.basename(workspace) != "agent_workspace"
-        or os.path.realpath(os.path.dirname(workspace)) != data_root
-    ):
-        raise RuntimeError("agent workspace must be the canonical child of DATA_DIR")
+    try:
+        if os.path.commonpath([workspace, data_root]) != data_root or workspace == data_root:
+            raise RuntimeError("agent workspace must resolve inside DATA_DIR")
+    except ValueError as exc:
+        raise RuntimeError("agent workspace must resolve inside DATA_DIR") from exc
     if os.path.lexists(workspace):
         mode = os.lstat(workspace).st_mode
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
@@ -54,8 +49,12 @@ def create_directories():
     else:
         os.mkdir(workspace, 0o700)
     resolved_workspace = os.path.realpath(workspace)
-    if resolved_workspace != expected_workspace:
-        raise RuntimeError("agent workspace must be the canonical child of DATA_DIR")
+    try:
+        inside = os.path.commonpath([resolved_workspace, data_root]) == data_root
+    except ValueError:
+        inside = False
+    if resolved_workspace == data_root or not inside:
+        raise RuntimeError("agent workspace must resolve inside DATA_DIR")
     try:
         os.chmod(workspace, 0o700)
     except OSError:
@@ -71,16 +70,6 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     Returns:
         Dictionary containing all initialized components
     """
-    # Fail fast on a misconfigured storage backend (ODYSSEUS_STORAGE_BACKEND=s3
-    # with missing env/boto3) — the error names exactly what is missing so it
-    # is actionable straight from the container logs. No silent local fallback.
-    validate_storage_backend_at_boot()
-
-    # Same fail-fast for the gallery object-storage lane (no-op unless
-    # ODYSSEUS_GALLERY_STORAGE=s3).
-    from src.gallery_storage import validate_gallery_storage_at_boot
-    validate_gallery_storage_at_boot()
-
     # Create directories first
     create_directories()
 

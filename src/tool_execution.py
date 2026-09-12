@@ -201,46 +201,31 @@ def _agent_readable_data_subdirs() -> tuple[str, ...]:
         UPLOAD_DIR,
     )
     configured = (
-        (AGENT_WORKSPACE_DIR, "agent_workspace", False),
-        (UPLOAD_DIR, "uploads", False),
+        (AGENT_WORKSPACE_DIR, False),
+        (UPLOAD_DIR, False),
         # This has a documented environment override and may legitimately
         # live outside DATA_DIR, but it must never equal/contain DATA_DIR.
-        (MAIL_ATTACHMENTS_DIR, "mail-attachments", True),
-        (PERSONAL_DIR, "personal_docs", False),
-        (PERSONAL_UPLOADS_DIR, "personal_uploads", False),
+        (MAIL_ATTACHMENTS_DIR, True),
+        (PERSONAL_DIR, False),
+        (PERSONAL_UPLOADS_DIR, False),
     )
-    configured_data_dir = os.path.abspath(os.path.expanduser(str(DATA_DIR)))
-    data_dir = os.path.realpath(configured_data_dir)
+    data_dir = os.path.realpath(DATA_DIR)
     safe: list[str] = []
-    for raw, internal_name, external_ok in configured:
+    for raw, external_ok in configured:
         value = str(raw or "").strip()
         # These paths are security-policy roots, not ordinary allowlist
-        # entries. Internal roles may inherit a relative DATA_DIR, but must
-        # still resolve to their exact canonical child below. External mail
-        # overrides require an absolute, disjoint directory.
-        if not value:
+        # entries.  Accept only explicit absolute directory paths.  State
+        # carve-outs must be strict DATA_DIR descendants; the documented mail
+        # override may also be disjoint.  Empty/dot, filesystem-root, ancestor,
+        # equality, file, or symlink-equivalent settings fail closed.
+        if not value or not os.path.isabs(os.path.expanduser(value)):
             continue
-        expanded = os.path.abspath(os.path.expanduser(value))
-        # A policy root must not acquire an exemption by redirecting its final
-        # path component to protected state or to an unrelated external tree.
-        if os.path.islink(expanded):
-            continue
-        resolved = os.path.realpath(expanded)
+        resolved = os.path.realpath(os.path.expanduser(value))
         if os.path.exists(resolved) and not os.path.isdir(resolved):
             continue
-        expected_internal = os.path.join(data_dir, internal_name)
-        expected_configured = os.path.join(configured_data_dir, internal_name)
-        inside_data = (
-            os.path.normcase(expanded)
-            in {
-                os.path.normcase(expected_configured),
-                os.path.normcase(expected_internal),
-            }
-            and resolved == expected_internal
-        )
+        inside_data = resolved != data_dir and _path_within(resolved, data_dir)
         external_safe = (
             external_ok
-            and os.path.isabs(os.path.expanduser(value))
             and resolved != data_dir
             and os.path.dirname(resolved) != resolved
             and not _path_within(data_dir, resolved)
@@ -494,13 +479,7 @@ def vet_workspace(raw: str) -> Optional[str]:
 def agent_cwd() -> str:
     """Working directory for agent subprocesses (bash/python/background jobs):
     the active workspace when set, else the persistent data dir."""
-    workspace = get_active_workspace()
-    if workspace:
-        return workspace
-    resolved = os.path.realpath(_AGENT_WORKDIR)
-    if resolved not in _agent_readable_data_subdirs():
-        raise RuntimeError("agent workspace is not a safe real directory")
-    return resolved
+    return get_active_workspace() or _AGENT_WORKDIR
 
 
 def get_mcp_manager():

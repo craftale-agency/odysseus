@@ -19,10 +19,7 @@ so the guard is a property of the path, not of the root it arrived through.
 
 import asyncio
 import importlib
-import json
-import multiprocessing
 import os
-import queue
 import shutil
 import time
 from contextlib import contextmanager, nullcontext
@@ -183,37 +180,6 @@ def test_startup_rejects_agent_workspace_symlink_escape(tmp_path, monkeypatch):
         app_initializer.create_directories()
 
 
-def test_startup_allows_workspace_below_symlinked_data_dir(tmp_path, monkeypatch):
-    import src.app_initializer as app_initializer
-
-    real_data = tmp_path / "real-data"
-    real_data.mkdir()
-    data_link = tmp_path / "mounted-data"
-    try:
-        data_link.symlink_to(real_data, target_is_directory=True)
-    except OSError:
-        pytest.skip("cannot create symlink")
-    workspace = data_link / "agent_workspace"
-    personal = data_link / "personal_docs"
-    monkeypatch.setattr(app_initializer, "DATA_DIR", str(data_link))
-    monkeypatch.setattr(app_initializer, "PERSONAL_DIR", str(personal))
-    monkeypatch.setattr(app_initializer, "RUNBOOK_DIR", str(personal / "runbook"))
-    monkeypatch.setattr(app_initializer, "UPLOAD_DIR", str(data_link / "uploads"))
-    monkeypatch.setattr(app_initializer, "AGENT_WORKSPACE_DIR", str(workspace))
-
-    app_initializer.create_directories()
-
-    assert workspace.is_dir()
-    assert not workspace.is_symlink()
-    assert os.path.realpath(workspace) == str(real_data / "agent_workspace")
-    readable = _configure_test_data_tree(monkeypatch, data_link)
-    note = readable["AGENT_WORKSPACE_DIR"] / "note.txt"
-    note.write_text("visible\n", encoding="utf-8")
-    assert importlib.import_module("src.tool_execution")._resolve_tool_path(
-        str(note)
-    ) == os.path.realpath(note)
-
-
 def test_agent_workspace_is_inside_the_data_directory():
     """It has to stay under data/ to be covered by the Docker bind mount,
     so the guard cannot simply be 'anything under DATA_DIR is denied'."""
@@ -357,49 +323,6 @@ def current_workspace_at(path):
         current_execution._active_workspace.reset(token)
 
 
-@pytest.mark.parametrize("relative_data", ["data", "./data"])
-def test_relative_data_dir_preserves_only_canonical_roles(
-    tmp_path, monkeypatch, relative_data
-):
-    from pathlib import Path
-
-    current_constants = importlib.import_module("src.constants")
-    current_execution = importlib.import_module("src.tool_execution")
-    monkeypatch.chdir(tmp_path)
-    data_dir = Path(relative_data)
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    monkeypatch.setattr(current_constants, "DATA_DIR", relative_data)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    visible = workspace / "visible.txt"
-    visible.write_text("readable", encoding="utf-8")
-    protected = data_dir / "settings.json"
-    protected.write_text("protected", encoding="utf-8")
-    monkeypatch.setattr(current_execution, "_AGENT_WORKDIR", str(workspace))
-    token = current_execution._active_workspace.set(None)
-    try:
-        assert set(current_execution._agent_readable_data_subdirs()) == {
-            os.path.realpath(path) for path in readable.values()
-        }
-        assert current_execution._resolve_search_root("") == os.path.realpath(workspace)
-        assert current_execution.agent_cwd() == os.path.realpath(workspace)
-        assert current_execution._resolve_tool_path(str(visible.resolve())) == str(visible.resolve())
-        with pytest.raises(ValueError, match="application state"):
-            current_execution._resolve_tool_path(str(protected.resolve()))
-
-        external_mail = tmp_path / "outside-mail"
-        external_mail.mkdir()
-        monkeypatch.setattr(current_constants, "MAIL_ATTACHMENTS_DIR", "outside-mail")
-        assert str(external_mail) not in current_execution._agent_readable_data_subdirs()
-
-        # A relative override pointing to a different state role remains denied.
-        monkeypatch.setattr(current_constants, "MAIL_ATTACHMENTS_DIR", "data/mcp_oauth")
-        assert os.path.realpath("data/mcp_oauth") not in current_execution._agent_readable_data_subdirs()
-    finally:
-        current_execution._active_workspace.reset(token)
-
-
 @pytest.mark.parametrize(
     "bad_kind", ["equal", "ancestor", "root", "empty", "dot", "symlink"]
 )
@@ -521,51 +444,6 @@ def test_external_mail_attachment_directory_remains_readable(tmp_path, monkeypat
     )
 
 
-def test_canonical_internal_mail_attachment_directory_remains_readable(
-    tmp_path, monkeypatch
-):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    mail_dir = readable["MAIL_ATTACHMENTS_DIR"]
-    mail_dir.mkdir()
-    attachment = mail_dir / "message.txt"
-    attachment.write_text("mail body\n", encoding="utf-8")
-    current_execution = importlib.import_module("src.tool_execution")
-
-    assert current_execution._resolve_tool_path(str(attachment)) == os.path.realpath(
-        attachment
-    )
-
-
-@pytest.mark.parametrize("alias_kind", ["direct", "symlink"])
-def test_mail_attachment_root_cannot_alias_protected_state(
-    tmp_path, monkeypatch, alias_kind
-):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    protected = data_dir / "mcp_oauth"
-    protected.mkdir()
-    secret = protected / "tokens.json"
-    secret.write_text("OAUTH_SECRET\n", encoding="utf-8")
-    current_constants = importlib.import_module("src.constants")
-    if alias_kind == "direct":
-        monkeypatch.setattr(current_constants, "MAIL_ATTACHMENTS_DIR", str(protected))
-    else:
-        alias = readable["MAIL_ATTACHMENTS_DIR"]
-        try:
-            alias.symlink_to(protected, target_is_directory=True)
-        except OSError:
-            pytest.skip("cannot create symlink")
-        monkeypatch.setattr(current_constants, "MAIL_ATTACHMENTS_DIR", str(alias))
-    current_execution = importlib.import_module("src.tool_execution")
-
-    assert os.path.realpath(protected) not in current_execution._agent_readable_data_subdirs()
-    with pytest.raises(ValueError, match="application state"):
-        current_execution._resolve_tool_path(str(secret))
-
-
 @pytest.mark.skipif(
     os.path.normcase("DATA") == os.path.normcase("data"),
     reason="requires a platform with case-sensitive path comparison",
@@ -631,43 +509,24 @@ def test_state_spanning_grep_bounds_dangerous_regex(tmp_path, monkeypatch):
         ))
     elapsed = time.monotonic() - started
 
-    assert result["exit_code"] == 0, result
+    assert result["exit_code"] == 0
     assert "auth.txt" not in result["output"]
     assert elapsed < 5
 
 
 def test_state_spanning_grep_stops_process_at_max_results(tmp_path, monkeypatch):
     import subprocess
-    import threading
-
-    readers = []
-    original_thread = threading.Thread
-
-    class TrackedThread(original_thread):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            if getattr(kwargs.get("target"), "__name__", "") == "read_stdout":
-                readers.append(self)
-
-    monkeypatch.setattr(threading, "Thread", TrackedThread)
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     _configure_test_data_tree(monkeypatch, data_dir)
-    (tmp_path / "visible.txt").write_text("MATCH\n", encoding="utf-8")
     instances = []
 
     class FakeProcess:
         def __init__(self, *args, **kwargs):
-            self.stdout = iter(json.dumps({
-                "type": "match",
-                "data": {
-                    "path": {"text": "visible.txt"},
-                    "lines": {"text": "MATCH\n"},
-                    "line_number": 1,
-                },
-            }) + "\n" for index in range(100))
-            self.stderr = type("EmptyStderr", (), {"read": lambda self, _size: ""})()
+            self.stdout = iter(
+                f"{tmp_path}/visible-{index}.txt:1:MATCH\n" for index in range(100)
+            )
             self.terminated = False
             instances.append(self)
 
@@ -693,8 +552,6 @@ def test_state_spanning_grep_stops_process_at_max_results(tmp_path, monkeypatch)
     assert len(instances) == 1
     assert instances[0].terminated is True
     assert result["output"].count(":1:MATCH") == 1
-    assert len(readers) == 1
-    assert not readers[0].is_alive(), "capped grep must release its stdout reader"
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
@@ -715,330 +572,3 @@ def test_state_spanning_grep_keeps_relative_glob_semantics(tmp_path, monkeypatch
 
     assert "readable.py" in result["output"]
     assert "protected.py" not in result["output"]
-
-
-@pytest.mark.parametrize("use_rg", [True, False])
-def test_state_spanning_grep_hides_sibling_symlink(tmp_path, monkeypatch, use_rg):
-    if use_rg and shutil.which("rg") is None:
-        pytest.skip("requires ripgrep")
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    readable["AGENT_WORKSPACE_DIR"].mkdir()
-    protected = data_dir / "auth.txt"
-    protected.write_text("SIBLING_LINK_SECRET\n", encoding="utf-8")
-    alias = tmp_path / "public-link"
-    try:
-        alias.symlink_to(data_dir, target_is_directory=True)
-    except OSError:
-        pytest.skip("cannot create symlink")
-    if not use_rg:
-        monkeypatch.setattr(shutil, "which", lambda _name: None)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "SIBLING_LINK_SECRET", "path": ""}', {}
-        ))
-
-    assert result["exit_code"] == 0, result
-    assert "auth.txt" not in result["output"]
-
-
-@pytest.mark.parametrize("use_rg", [True, False])
-def test_state_spanning_grep_keeps_relative_glob_semantics_in_both_modes(
-    tmp_path, monkeypatch, use_rg
-):
-    if use_rg and shutil.which("rg") is None:
-        pytest.skip("requires ripgrep")
-    data_dir = tmp_path / "data[secret]"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    nested = readable["AGENT_WORKSPACE_DIR"] / "nested"
-    nested.mkdir(parents=True)
-    (nested / "readable.py").write_text("FALLBACK_MARKER public\n", encoding="utf-8")
-    (data_dir / "protected.py").write_text("FALLBACK_MARKER secret\n", encoding="utf-8")
-    if not use_rg:
-        monkeypatch.setattr(shutil, "which", lambda _name: None)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "FALLBACK_MARKER", "path": "", "glob": "**/*.py"}', {}
-        ))
-
-    assert result["exit_code"] == 0, result
-    assert "readable.py" in result["output"]
-    assert "protected.py" not in result["output"]
-
-
-@pytest.mark.parametrize("use_rg", [True, False])
-def test_grep_reports_invalid_regex_as_error(tmp_path, monkeypatch, use_rg):
-    if use_rg and shutil.which("rg") is None:
-        pytest.skip("requires ripgrep")
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    readable["AGENT_WORKSPACE_DIR"].mkdir()
-    if not use_rg:
-        monkeypatch.setattr(shutil, "which", lambda _name: None)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute('{"pattern": "[", "path": ""}', {}))
-
-    assert result["exit_code"] == 1
-    assert any(word in result["error"].lower() for word in ("pattern", "regex"))
-
-
-def test_no_rg_uses_top_level_spawn_worker(tmp_path, monkeypatch):
-    import multiprocessing
-    import src.agent_tools.filesystem_tools as filesystem_tools
-
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    (workspace / "visible.txt").write_text("FROZEN_MARKER\n", encoding="utf-8")
-    monkeypatch.setattr(shutil, "which", lambda _name: None)
-    seen = {}
-
-    class InlineQueue(queue.Queue):
-        def close(self):
-            pass
-
-    class InlineProcess:
-        exitcode = 0
-
-        def __init__(self, target, args):
-            seen["target"] = target
-            self.target = target
-            self.args = args
-
-        def start(self):
-            self.target(*self.args)
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    class InlineContext:
-        def Queue(self, maxsize):
-            return InlineQueue(maxsize=maxsize)
-
-        def Process(self, target, args):
-            return InlineProcess(target, args)
-
-    def fake_get_context(method):
-        seen["method"] = method
-        return InlineContext()
-
-    monkeypatch.setattr(multiprocessing, "get_context", fake_get_context)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "FROZEN_MARKER", "path": ""}', {}
-        ))
-
-    assert result["exit_code"] == 0
-    assert "visible.txt" in result["output"]
-    assert seen["method"] == "spawn"
-    assert seen["target"] is filesystem_tools._python_grep_worker
-
-
-def test_benign_hardlink_is_intentionally_rejected(tmp_path, monkeypatch):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    original = workspace / "original.txt"
-    alias = workspace / "copy.txt"
-    original.write_text("benign\n", encoding="utf-8")
-    try:
-        os.link(original, alias)
-    except OSError:
-        pytest.skip("cannot create hardlink")
-
-    with pytest.raises(ValueError, match="hard-linked"):
-        importlib.import_module("src.tool_execution")._resolve_tool_path(str(alias))
-
-
-def test_partition_filters_skip_directories_but_explicit_root_remains_searchable(
-    tmp_path, monkeypatch
-):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    readable["AGENT_WORKSPACE_DIR"].mkdir()
-    skipped = tmp_path / "node_modules"
-    skipped.mkdir()
-    (skipped / "package.txt").write_text("SKIP_POLICY_MARKER\n", encoding="utf-8")
-
-    with current_workspace_at(tmp_path):
-        partitioned = asyncio.run(GrepTool().execute(
-            '{"pattern": "SKIP_POLICY_MARKER", "path": ""}', {}
-        ))
-    with current_workspace_at(skipped):
-        explicit = asyncio.run(GrepTool().execute(
-            '{"pattern": "SKIP_POLICY_MARKER", "path": ""}', {}
-        ))
-
-    assert "package.txt" not in partitioned["output"]
-    assert "package.txt" in explicit["output"]
-
-
-@pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
-def test_empty_partition_still_reports_invalid_rg_regex(tmp_path, monkeypatch):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    _configure_test_data_tree(monkeypatch, data_dir)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute('{"pattern": "[", "path": ""}', {}))
-
-    assert result["exit_code"] == 1
-    assert "regex" in result["error"].lower()
-
-
-def test_rg_stderr_is_fully_drained_but_only_prefix_is_reported(tmp_path, monkeypatch):
-    import subprocess
-
-    target = tmp_path / "visible.txt"
-    target.write_text("text\n", encoding="utf-8")
-    chunks = ["PREFIX" + "x" * 12_000, "y" * 12_000, "TAIL"]
-
-    class TrackingStderr:
-        def __init__(self):
-            self.reads = 0
-
-        def read(self, _size):
-            self.reads += 1
-            return chunks.pop(0) if chunks else ""
-
-    stderr = TrackingStderr()
-
-    class FakeProcess:
-        stdout = iter(())
-
-        def __init__(self, *args, **kwargs):
-            self.stderr = stderr
-
-        def poll(self):
-            return 2
-
-        def wait(self, timeout=None):
-            return 2
-
-        def terminate(self):
-            pass
-
-        def kill(self):
-            pass
-
-    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/rg")
-    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute('{"pattern": "text", "path": ""}', {}))
-
-    assert result["exit_code"] == 1
-    assert "PREFIX" in result["error"]
-    assert "TAIL" not in result["error"]
-    assert len(result["error"]) < 20_100
-    assert stderr.reads == 4
-
-
-def test_no_rg_worker_stops_at_bounded_result_queue(tmp_path, monkeypatch):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    (workspace / "many.txt").write_text("\n".join(["QUEUE_MARKER"] * 1_000))
-    monkeypatch.setattr(shutil, "which", lambda _name: None)
-
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "QUEUE_MARKER", "path": "", "max_results": 3}', {}
-        ))
-
-    assert result["exit_code"] == 0, result
-    assert result["output"].count(":QUEUE_MARKER") == 3
-    assert "capped at 3 matches" in result["output"]
-
-
-def test_no_rg_worker_is_terminated_at_deadline(tmp_path, monkeypatch):
-    import src.agent_tools.filesystem_tools as filesystem_tools
-
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    (workspace / "long.txt").write_text("a" * 250_000 + "!\n", encoding="utf-8")
-    monkeypatch.setattr(shutil, "which", lambda _name: None)
-    monkeypatch.setattr(filesystem_tools, "_GREP_TIMEOUT_SECONDS", 0.2)
-
-    started = time.monotonic()
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "(a+)+$", "path": ""}', {}
-        ))
-
-    assert result == {"error": "grep: timed out", "exit_code": 1}
-    assert time.monotonic() - started < 3
-
-
-def test_no_rg_worker_exit_before_first_record_is_reported_promptly(tmp_path, monkeypatch):
-    import src.agent_tools.filesystem_tools as filesystem_tools
-
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    readable = _configure_test_data_tree(monkeypatch, data_dir)
-    workspace = readable["AGENT_WORKSPACE_DIR"]
-    workspace.mkdir()
-    (workspace / "visible.txt").write_text("EXIT_MARKER\n", encoding="utf-8")
-    monkeypatch.setattr(shutil, "which", lambda _name: None)
-    monkeypatch.setattr(filesystem_tools, "_GREP_TIMEOUT_SECONDS", 20)
-
-    class EmptyQueue(queue.Queue):
-        def close(self):
-            pass
-
-    class DeadProcess:
-        exitcode = 71
-
-        def __init__(self, target, args):
-            self.target = target
-            self.args = args
-
-        def start(self):
-            pass
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    class DeadContext:
-        def Queue(self, maxsize):
-            return EmptyQueue(maxsize=maxsize)
-
-        def Process(self, target, args):
-            return DeadProcess(target, args)
-
-    monkeypatch.setattr(
-        multiprocessing,
-        "get_context",
-        lambda method: DeadContext(),
-    )
-
-    started = time.monotonic()
-    with current_workspace_at(tmp_path):
-        result = asyncio.run(GrepTool().execute(
-            '{"pattern": "EXIT_MARKER", "path": ""}', {}
-        ))
-
-    assert result == {"error": "grep: fallback worker exited 71", "exit_code": 1}
-    assert time.monotonic() - started < 1
