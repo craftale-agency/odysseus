@@ -305,7 +305,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 
         elif action == "toggle_item":
             note_id = args.get("id", "")
-            index = args.get("index", 0)
+            index = args.get("index")
             note = _note_by_prefix(note_id)
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
@@ -314,6 +314,24 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             if not note.items:
                 return {"error": "Note has no checklist items", "exit_code": 1}
             items = json.loads(note.items)
+            if args.get("index") is None:
+                # Empty-args guard (2026-09-10 family, see calendar 0c29caf7):
+                # the old `args.get("index", 0)` default silently toggled the
+                # FIRST item of a multi-item checklist — a misdirected
+                # mutation the model believed targeted the item it meant. On
+                # a single-item checklist index 0 is unambiguous and the
+                # default is kept; with several items refusing beats guessing.
+                if len(items) > 1:
+                    return {
+                        "error": (
+                            "toggle_item requires an explicit 'index' — this"
+                            f" checklist has {len(items)} items (0-{len(items)-1})"
+                            " and no item was toggled. Re-send with the index of"
+                            " the item to flip."
+                        ),
+                        "exit_code": 1,
+                    }
+                index = 0
             if index < 0 or index >= len(items):
                 return {"error": f"Item index {index} out of range (0-{len(items)-1})", "exit_code": 1}
             items[index]["done"] = not items[index].get("done", False)

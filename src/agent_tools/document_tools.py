@@ -778,7 +778,27 @@ class ManageDocumentTool:
         except ValueError:
             return {"error": "Invalid JSON arguments", "exit_code": 1}
 
-        action = args.get("action", "list")
+        # 2026-09-10 live incident family (empty-args tool calls, qwen3.5:9b —
+        # see the calendar fix 0c29caf7 and the read_email guard): a payload
+        # that names a document but omits `action` is ambiguous between read
+        # and delete, and the silent list default answers a question nobody
+        # asked. Reject it loudly with the exact fix. Genuinely list-shaped
+        # payloads — no args, or only search/language/limit filters — KEEP the
+        # silent list default (the schema documents list as the no-arg call).
+        raw_action = str(args.get("action") or "").strip()
+        if not raw_action:
+            if any(args.get(k) not in (None, "") for k in ("document_id", "id", "uid")):
+                return {
+                    "error": (
+                        "manage_documents requires an explicit 'action' when you name"
+                        " a document. Your payload carries a document id — add"
+                        ' "action": "read" (view its content) or "action": "delete"'
+                        " (remove it). Valid actions: list, read, delete, tidy"
+                    ),
+                    "exit_code": 1,
+                }
+            raw_action = "list"
+        action = raw_action
         db = SessionLocal()
 
         def _rel(ts):
@@ -864,15 +884,30 @@ class ManageDocumentTool:
                 }
 
             elif action == "delete":
-                doc_id = args.get("document_id") or args.get("id") or args.get("uid") or _active_document_id
-                doc = None
-                if doc_id:
-                    doc = _get_owned_document(db, Document, doc_id, owner)
+                # Delete is destructive and the schema/tool hint document it
+                # as "action='delete' with document_id" — the old fallback to
+                # the ACTIVE document, then to the MOST RECENTLY UPDATED one,
+                # silently soft-deleted whatever was last touched when a call
+                # arrived with no id at all (the empty-args family,
+                # 2026-09-10). Require the explicit id; nothing is deleted
+                # otherwise. Recovery from a wrong soft-delete is a manual DB
+                # edit, so err loud, not lucky.
+                doc_id = (
+                    args.get("document_id") or args.get("id") or args.get("uid") or ""
+                )
+                if not str(doc_id or "").strip():
+                    return {
+                        "error": (
+                            "manage_documents delete requires an explicit"
+                            " document_id — no document was deleted. Use"
+                            " action=list to find the id (rows carry"
+                            " #document-<id> anchors), then delete that id."
+                        ),
+                        "exit_code": 1,
+                    }
+                doc = _get_owned_document(db, Document, doc_id, owner)
                 if not doc:
-                    # Fallback: most recently updated doc (likely what the user means)
-                    doc = _most_recent_owned_document(db, Document, owner, active_only=True)
-                if not doc:
-                    return {"error": "No document to delete", "exit_code": 1}
+                    return {"error": f"Document '{doc_id}' not found", "exit_code": 1}
                 title = doc.title
                 doc.is_active = False
                 db.commit()
