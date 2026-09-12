@@ -1255,6 +1255,14 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
     fixture = _fixture_read_email(uid=uid, message_id=message_id, folder=folder, account=account)
     if fixture is not None:
         return fixture
+    if not str(uid or "").strip() and not str(message_id or "").strip():
+        # Validate BEFORE resolving/connecting. _imap_connect opens the
+        # default account when `account` is None, so an arg-less call used
+        # to spend a full IMAP round-trip — surfacing that account's auth
+        # error instead of the real problem — before the old "No UID" check
+        # further down ever ran. The call_tool guard above carries the loud
+        # self-service message; this keeps every internal caller honest too.
+        return {"error": "No UID or Message-ID provided"}
     cfg = _load_config(account)
     conn = None
     try:
@@ -2482,7 +2490,10 @@ async def list_tools() -> list[Tool]:
             name="read_email",
             description=(
                 "Read the full content of a specific email. "
-                "Provide either the UID (from list_emails) or a Message-ID. "
+                "Provide either the UID (from list_emails) or a Message-ID — "
+                "one of the two is REQUIRED; a call with neither is rejected "
+                "before any mailbox is contacted (call list_emails or "
+                "search_emails first to get UIDs). "
                 "Returns the subject, sender, date, and full body text."
             ),
             inputSchema={
@@ -2490,11 +2501,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "uid": {
                         "type": "string",
-                        "description": "Email UID from list_emails results",
+                        "description": "Email UID from list_emails results (required unless message_id is given)",
                     },
                     "message_id": {
                         "type": "string",
-                        "description": "RFC Message-ID header value",
+                        "description": "RFC Message-ID header value (required unless uid is given)",
                     },
                     "folder": {
                         "type": "string",
@@ -2720,17 +2731,50 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "read_email":
+            uid = str(arguments.get("uid") or "").strip()
+            message_id = str(arguments.get("message_id") or "").strip()
+            if not uid and not message_id:
+                # 2026-09-10 live incident (qwen3.5:9b): the model emitted
+                # read_email with empty args {} twice. The old path resolved
+                # the DEFAULT account, opened IMAP for it, and surfaced that
+                # account's own error ("Basic authentication is disabled" on
+                # a basic-auth-disabled mailbox) instead of "you gave me no
+                # uid" — a failure the model could not act on; the
+                # loop-breaker then keyed both calls as identical repetition
+                # and the session degraded to plain chat. Same family as the
+                # calendar action-less spiral (0c29caf7): reject the call
+                # LOUDLY, before any mailbox is contacted, and put the
+                # self-service next move in the message so the model recovers
+                # in one round.
+                all_accounts = _list_accounts_raw()
+                account_hint = ""
+                if len(all_accounts) >= 2:
+                    names = ", ".join(
+                        (r.get("name") or r.get("imap_user") or r.get("id") or "?")
+                        + (" (default)" if r.get("is_default") else "")
+                        for r in all_accounts
+                    )
+                    account_hint = (
+                        " Several accounts are configured — also pass 'account' to"
+                        f" pick one. Available: {names}."
+                    )
+                return [TextContent(type="text", text=(
+                    "Error: read_email requires an explicit 'uid' (from list_emails)"
+                    " or 'message_id'; neither was provided, so no mailbox was"
+                    " contacted. Call list_emails (or search_emails) first to get"
+                    f" UIDs, then call read_email with one.{account_hint}"
+                ))]
             all_accounts = _list_accounts_raw()
             if len(all_accounts) >= 2 and not acct:
                 result = _read_email_across_accounts(
-                    uid=arguments.get("uid"),
-                    message_id=arguments.get("message_id"),
+                    uid=uid,
+                    message_id=message_id,
                     folder=arguments.get("folder", "INBOX"),
                 )
             else:
                 result = _read_email(
-                    uid=arguments.get("uid"),
-                    message_id=arguments.get("message_id"),
+                    uid=uid,
+                    message_id=message_id,
                     folder=arguments.get("folder", "INBOX"),
                     account=acct,
                 )
