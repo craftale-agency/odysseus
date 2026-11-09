@@ -1531,9 +1531,32 @@ def _sanitize_email_html(raw: str) -> str:
     return f"<html><body>{inner}</body></html>"
 
 
+
+# ── API-token scope enforcement (ported from the Codex lane) ──
+# Raw email routes previously accepted ANY valid API token: a scope-chat
+# token could read mailboxes (probe 2026-11-09: /api/email/list 200).
+# Cookie-session callers are untouched; only bearer tokens are gated.
+EMAIL_READ_SCOPES = {"email:read", "email:draft", "email:send", "email:self"}
+EMAIL_SEND_SCOPES = {"email:send"}
+EMAIL_DRAFT_SCOPES = {"email:draft", "email:send"}
+
+
+def _require_email_scope(allowed: set):
+    """FastAPI dependency: bearer tokens must hold one of `allowed` scopes."""
+    def _guard(request: Request):
+        if not getattr(request.state, "api_token", False):
+            return  # cookie-session caller: existing auth applies
+        scopes = set(getattr(request.state, "api_token_scopes", []) or [])
+        if not scopes.intersection(allowed):
+            required = " or ".join(sorted(allowed))
+            raise HTTPException(403, f"API token missing required scope: {required}")
+    return _guard
+
+
 def setup_email_routes():
     _start_poller()
-    router = APIRouter(prefix="/api/email", tags=["email"])
+    router = APIRouter(prefix="/api/email", tags=["email"],
+                 dependencies=[Depends(_require_email_scope(EMAIL_READ_SCOPES))])
 
     # ── In-memory cache + prefetch + IMAP connection pool ──
     # Three layers stacked because every cold click was hitting Dovecot
@@ -2622,7 +2645,7 @@ def setup_email_routes():
             logger.error(f"unsubscribe scan failed: {e}")
             return {"success": False, "error": "Mail operation failed", "candidates": []}
 
-    @router.post("/unsubscribe/execute")
+    @router.post("/unsubscribe/execute", dependencies=[Depends(_require_email_scope(EMAIL_SEND_SCOPES))])
     def execute_unsubscribe(data: dict, owner: str = Depends(require_owner)):
         """Execute an approved unsubscribe action.
 
@@ -3814,7 +3837,7 @@ def setup_email_routes():
             logger.error(f"Failed to archive email {uid}: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    @router.delete("/delete/{uid}")
+    @router.delete("/delete/{uid}", dependencies=[Depends(_require_email_scope(EMAIL_SEND_SCOPES))])
     async def delete_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Move email to Trash."""
         try:
@@ -3829,7 +3852,7 @@ def setup_email_routes():
             logger.error(f"Failed to delete email {uid}: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    @router.delete("/delete-permanent/{uid}")
+    @router.delete("/delete-permanent/{uid}", dependencies=[Depends(_require_email_scope(EMAIL_SEND_SCOPES))])
     async def delete_email_permanent(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Permanently delete an email (no Trash)."""
         try:
@@ -4037,7 +4060,7 @@ def setup_email_routes():
             logger.error(f"Failed to clear answered {uid}: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    @router.post("/compose-upload")
+    @router.post("/compose-upload", dependencies=[Depends(_require_email_scope(EMAIL_DRAFT_SCOPES))])
     async def compose_upload(file: UploadFile = File(...), owner: str = Depends(require_owner)):
         """Upload a file for attaching to a compose email. Returns a token."""
         try:
@@ -4144,7 +4167,7 @@ def setup_email_routes():
 
         raise HTTPException(status_code=400, detail="Unknown attachment kind")
 
-    @router.post("/compose-from-odysseus")
+    @router.post("/compose-from-odysseus", dependencies=[Depends(_require_email_scope(EMAIL_DRAFT_SCOPES))])
     async def compose_from_odysseus(data: dict, owner: str = Depends(require_owner)):
         """Stage an Odysseus document or gallery image as a compose upload."""
         kind = str(data.get("kind") or "").strip().lower()
@@ -4168,7 +4191,7 @@ def setup_email_routes():
             logger.error(f"Failed to stage Odysseus attachment {kind}/{item_id}: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    @router.post("/compose-from-odysseus-zip")
+    @router.post("/compose-from-odysseus-zip", dependencies=[Depends(_require_email_scope(EMAIL_DRAFT_SCOPES))])
     async def compose_from_odysseus_zip(data: dict, owner: str = Depends(require_owner)):
         """Stage several Odysseus documents/gallery images as one zip attachment."""
         raw_items = data.get("items") or []
@@ -4220,7 +4243,7 @@ def setup_email_routes():
             logger.error(f"Failed to stage Odysseus zip attachment: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    @router.post("/compose-from-attachment/{uid}/{index}")
+    @router.post("/compose-from-attachment/{uid}/{index}", dependencies=[Depends(_require_email_scope(EMAIL_DRAFT_SCOPES))])
     async def compose_from_attachment(
         uid: str,
         index: int,
