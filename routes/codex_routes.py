@@ -268,6 +268,11 @@ def setup_codex_routes(
             from routes.email_helpers import _assert_owns_account
 
             _assert_owns_account(account_id, owner)
+        # cached_only=0 explicitly: calling the FastAPI handler directly
+        # bypasses DI, so an unset `cached_only` keeps its truthy Query(0)
+        # default object and every list silently served the stale local
+        # index (never IMAP) unless from_addr was set. cache_bust=None keeps
+        # the shared 8s memory cache for repeated identical lists.
         return await email_list_endpoint(
             folder=folder,
             limit=limit,
@@ -276,6 +281,7 @@ def setup_codex_routes(
             from_addr=from_addr,
             account_id=account_id,
             has_attachments=has_attachments,
+            cached_only=0,
             cache_bust=None,
             owner=owner,
         )
